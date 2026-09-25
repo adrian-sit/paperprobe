@@ -126,6 +126,27 @@ for their corresponding adapters and are not required to start the skeleton. Whe
 you add Gemini extraction, install its optional client with
 `pip install -e ".[dev,gemini]"`.
 
+### Local PostgreSQL
+
+Docker Desktop is used only to run PostgreSQL locally; the application schema is
+created by Alembic migrations. Ensure `.env` contains the `POSTGRES_*` values in
+`.env.example`, then run:
+
+```powershell
+docker compose up -d postgres
+.\.venv\Scripts\alembic upgrade head
+docker compose exec postgres psql -U paperprobe -d paperprobe -c "\dt"
+```
+
+This creates `papers`, `paper_sections`, `extracted_fields`, and `questions`.
+Future schema changes should be new Alembic revisions, generated after changing
+the SQLAlchemy models with:
+
+```powershell
+.\.venv\Scripts\alembic revision --autogenerate -m "describe the change"
+.\.venv\Scripts\alembic upgrade head
+```
+
 ## Usage
 
 ```powershell
