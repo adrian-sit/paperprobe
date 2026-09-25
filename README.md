@@ -14,7 +14,7 @@ The system draws on prompting, retrieval, fine-tuning, and agentic workflows as 
 
 ## Motivation
 
-I took a LLM-paper seminar class, whenever I tried to ask any LLM to think discussion questions based on the paper, it always generate very superficial or weird questions. However in class, many people have asked many insightful questions, and I have learned a lot on how to critique different papers. I wanted to explore if there are methods for the LLM to learn how to think better questions through an example dataset I have and through agentic workflows, for example learning from online peer reviews of other papers, or other methods.
+I took an LLM-paper seminar class, and whenever I tried to ask an LLM to think of discussion questions based on a paper, it always generated very superficial or strange questions. In class, however, many people asked genuinely insightful questions, and I learned a lot about how to critique different papers. I wanted to explore whether there are methods for an LLM to learn how to ask better questions, using an example dataset I have and through agentic workflows, for example, learning from online peer reviews of other papers, or other methods.
 
 ## Goals
 ### Learning Goals
