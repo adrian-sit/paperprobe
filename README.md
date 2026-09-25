@@ -1,5 +1,7 @@
 # PaperProbe
 
+**A research paper review assistant that extracts key information from papers and generates critical, deeply-related discussion questions, using fine-tuned and API-based LLMs behind a full-stack, agentic pipeline.**
+
 ## Overview
 
 PaperProbe takes a research paper (PDF or library entry), parses it, extracts structured information (claims, methods, datasets, baselines, limitations), retrieves related work and known reviewer critiques, and generates discussion questions similar to what a thoughtful peer reviewer would ask. Questions aren't limited to facts stated directly in the paper; they can raise broader implications, related work, or open problems, as long as they stay critical and closely tied to the paper's actual content.
@@ -9,6 +11,10 @@ The project has two purposes:
 2. Serve as a hands-on project for LLM application engineering, covering APIs, backends, databases, fine-tuning, orchestration, and deployment.
 
 The system draws on prompting, retrieval, fine-tuning, and agentic workflows as complementary techniques, combined into a single pipeline aimed at the strongest overall result, rather than treated as separate options to benchmark against each other.
+
+## Motivation
+
+I took a LLM-paper seminar class, whenever I tried to ask any LLM to think discussion questions based on the paper, it always generate very superficial or weird questions. However in class, many people have asked many insightful questions, and I have learned a lot on how to critique different papers. I wanted to explore if there are methods for the LLM to learn how to think better questions through an example dataset I have and through agentic workflows, for example learning from online peer reviews of other papers, or other methods.
 
 ## Goals
 ### Learning Goals
@@ -33,7 +39,7 @@ The system draws on prompting, retrieval, fine-tuning, and agentic workflows as 
 - Retrieval of related papers and reviewer critiques
 
 ### Agentic Workflow
-The core pipeline isn't a single prompt — it's a small sequence of steps where the LLM's output at one step decides what happens next. That's what makes it "agentic" rather than a fixed script. Planned steps, roughly in build order:
+The core pipeline isn't a single prompt, it's a small sequence of steps where the LLM's output at one step decides what happens next. Planned steps, roughly in build order:
 
 1. Extract → Generate → Critique loop: extract the paper's claims/methods, generate discussion questions from them, then have a second pass judge each question (too vague? already answered in the paper? not actually critical?) and send weak ones back to be rewritten, up to a couple of tries.
 2. Look-up step before generating: before writing questions, the pipeline can search for related papers or past reviewer comments on similar work, so questions can reference relevant context instead of only the paper's own text.
@@ -72,7 +78,7 @@ Early, high-level thinking on the first two pieces of the pipeline. Details (sch
 - Raw review text is treated as source data for local processing only; it will not be committed to the repo or redistributed in bulk. Only derived artifacts (extracted fields, generated questions, aggregate stats) are shared publicly.
 
 ### Gemini-based extraction
-- Gemini API (free tier initially, paid pay-as-you-go once evaluation runs need volume) used for the structured extraction step: turning raw paper text into claims, methods, datasets, baselines, and limitations via a schema-constrained prompt (JSON output).
+- Gemini API (free tier) used for the structured extraction step: turning raw paper text into claims, methods, datasets, baselines, and limitations via a schema-constrained prompt (JSON output).
 - Model choice is swappable behind a thin interface so extraction and generation can move to the fine-tuned/vLLM-served model once it's ready, without rewriting the pipeline around it.
 - Extraction prompts are versioned so quality can be tracked as they're iterated on, rather than silently changing.
 
@@ -84,8 +90,58 @@ Early, high-level thinking on the first two pieces of the pipeline. Details (sch
 5. Integration: frontend, feedback loop, observability
 
 ## Project Structure
+
+```
+app/
+  api/routes/       # HTTP endpoints
+  core/config.py    # environment-based settings
+  schemas/          # validated API request/response models
+  main.py           # FastAPI application factory
+tests/              # API tests
+.env.example        # safe configuration template
+```
+
+The first API surface is intentionally small: `GET /api/v1/health`,
+`GET /api/v1/readiness`, and `POST /api/v1/papers`. The paper endpoint validates
+a PDF URL or OpenReview forum ID and returns an accepted job-shaped response. It
+does not yet download, persist, or extract a paper; those belong behind a
+database-backed background worker in the next increment.
+
 ## Setup
+
+Requires Python 3.11 or later. Create a virtual environment, install the API
+and development dependencies, then create local configuration:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -e ".[dev]"
+copy .env.example .env
+```
+
+Add `GEMINI_API_KEY` to `.env` when you begin the Gemini extraction service.
+The file is git-ignored; `.env.example` documents every expected setting without
+containing any secrets. PostgreSQL, MongoDB, and OpenReview settings are reserved
+for their corresponding adapters and are not required to start the skeleton. When
+you add Gemini extraction, install its optional client with
+`pip install -e ".[dev,gemini]"`.
+
 ## Usage
+
+```powershell
+uvicorn app.main:app --reload
+```
+
+Open `http://127.0.0.1:8000/docs` for the generated interactive API docs. For a
+quick ingestion-contract check:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/v1/papers `
+  -ContentType "application/json" `
+  -Body '{"pdf_url":"https://example.org/paper.pdf"}'
+```
+
+Run the initial test suite with `pytest`.
 ## License
 Code in this repository is licensed under MIT see([LICENSE](LICENSE)). This covers the codebase only:
 
