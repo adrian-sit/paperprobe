@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PaperProbe</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header>
+        <p class="eyebrow">PAPERPROBE</p>
+        <h1>Read papers critically.</h1>
+        <p class="lede">Fetch an OpenReview paper, inspect its structured extraction, then generate focused discussion questions.</p>
+      </header>
+
+      <section class="panel intake">
+        <div>
+          <h2>Start with an OpenReview forum</h2>
+          <p>Paste the value after <code>forum?id=</code> from a public OpenReview paper URL.</p>
+        </div>
+        <form id="ingest-form">
+          <label for="forum-id">Forum ID</label>
+          <div class="input-row">
+            <input id="forum-id" name="forum-id" required placeholder="e.g. abc123" autocomplete="off" />
+            <button type="submit" id="fetch-button">Fetch and extract</button>
+          </div>
+        </form>
+        <p class="status" id="status" role="status"></p>
+      </section>
+
+      <section id="paper-view" hidden>
+        <article class="panel paper-card">
+          <div class="paper-heading">
+            <div><p class="eyebrow">PAPER</p><h2 id="paper-title"></h2></div>
+            <a id="source-link" target="_blank" rel="noreferrer">Open on OpenReview</a>
+          </div>
+          <h3>Abstract</h3>
+          <p id="abstract"></p>
+        </article>
+
+        <section class="panel">
+          <p class="eyebrow">GEMINI EXTRACTION</p>
+          <div id="extraction-grid" class="extraction-grid"></div>
+        </section>
+
+        <section class="panel questions-panel">
+          <div class="paper-heading">
+            <div><p class="eyebrow">DISCUSSION QUESTIONS</p><h2>Interrogate the paper</h2></div>
+            <button id="question-button" type="button">Generate 5 questions</button>
+          </div>
+          <p class="hint">Questions use only the title, abstract, and extracted fields already stored for this paper.</p>
+          <ol id="questions" class="questions"></ol>
+        </section>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

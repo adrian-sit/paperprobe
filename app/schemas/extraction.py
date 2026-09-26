@@ -15,3 +15,13 @@ class AbstractExtraction(BaseModel):
     datasets: list[str] = Field(default_factory=list)
     baselines: list[str] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
+
+
+class GeneratedQuestion(BaseModel):
+    question: str = Field(description="A specific, answerable question for discussing the paper.")
+    focus: str = Field(description="Short label such as methodology, evidence, or limitation.")
+    rationale: str = Field(description="Why this question is useful given the supplied paper information.")
+
+
+class QuestionGeneration(BaseModel):
+    questions: list[GeneratedQuestion] = Field(min_length=1, max_length=10)

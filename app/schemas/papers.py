@@ -33,3 +33,22 @@ class PaperDetail(BaseModel):
     created_at: datetime
     sections: list[StoredSection]
     extracted_fields: list[StoredExtractedField]
+    from_cache: bool = False
+
+
+class QuestionGenerationRequest(BaseModel):
+    count: int = Field(default=5, ge=3, le=10)
+
+
+class StoredQuestion(BaseModel):
+    id: UUID
+    text: str
+    status: str
+    source: str
+    critic_notes: str | None
+    created_at: datetime
+
+
+class QuestionGenerationResponse(BaseModel):
+    paper_id: UUID
+    questions: list[StoredQuestion]

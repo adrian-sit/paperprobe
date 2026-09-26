@@ -168,6 +168,14 @@ uses Gemini to produce structured fields, and saves the abstract plus each
 extraction field in PostgreSQL. It is synchronous for now; a background job
 will replace this endpoint's long-running work as the pipeline grows.
 
+Submitting the same forum ID again returns the stored record immediately with
+`from_cache: true`; it does not call OpenReview or Gemini again. A new paper
+returns HTTP 201, while a cached paper returns HTTP 200.
+
+Open `http://127.0.0.1:8000/` for the browser interface. It provides the same
+ingestion flow, renders extracted fields as readable cards, and lets you generate
+five Gemini discussion questions from the stored title, abstract, and fields.
+
 Run the initial test suite with `pytest`.
 
 ### External API smoke test

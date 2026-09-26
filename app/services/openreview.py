@@ -21,7 +21,12 @@ class OpenReviewPaper:
 
     @property
     def source_uri(self) -> str:
-        return f"https://openreview.net/forum?id={self.forum_id}"
+        return forum_source_uri(self.forum_id)
+
+
+def forum_source_uri(forum_id: str) -> str:
+    """Create the stable storage key before making an OpenReview request."""
+    return f"https://openreview.net/forum?id={forum_id}"
 
 
 def _content_text(note: object, field: str) -> str:
