@@ -163,6 +163,28 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/v1/papers `
 ```
 
 Run the initial test suite with `pytest`.
+
+### External API smoke test
+
+The standalone smoke test fetches one public OpenReview forum and prints its
+submission, abstract, and first review. With `--run-gemini`, it then sends only
+the title and abstract to Gemini and prints a Pydantic-validated JSON extraction.
+It does not call the FastAPI server, write to PostgreSQL, or persist source text.
+
+Set a public forum ID in `.env` as `OPENREVIEW_FORUM_ID`, install the optional
+clients, and run it:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[openreview,gemini]"
+.\.venv\Scripts\python.exe scripts\smoke_external_apis.py
+.\.venv\Scripts\python.exe scripts\smoke_external_apis.py --run-gemini
+```
+
+Alternatively, pass an ID for a one-off fetch:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\smoke_external_apis.py --forum-id <public-forum-id>
+```
 ## License
 Code in this repository is licensed under MIT see([LICENSE](LICENSE)). This covers the codebase only:
 

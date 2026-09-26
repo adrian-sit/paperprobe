@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     mongodb_database: str = "paperprobe"
     openreview_username: str | None = None
     openreview_password: str | None = None
+    openreview_forum_id: str | None = None
 
     @property
     def cors_origin_list(self) -> list[str]:
