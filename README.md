@@ -154,13 +154,19 @@ uvicorn app.main:app --reload
 ```
 
 Open `http://127.0.0.1:8000/docs` for the generated interactive API docs. For a
-quick ingestion-contract check:
+first end-to-end ingestion, after setting `GEMINI_API_KEY`:
 
 ```powershell
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/v1/papers `
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/v1/papers/openreview `
   -ContentType "application/json" `
-  -Body '{"pdf_url":"https://example.org/paper.pdf"}'
+  -Body '{"forum_id":"<public-openreview-forum-id>"}'
 ```
+
+The response contains the persisted paper ID. Retrieve it with
+`GET /api/v1/papers/{paper_id}`. The initial flow fetches title and abstract,
+uses Gemini to produce structured fields, and saves the abstract plus each
+extraction field in PostgreSQL. It is synchronous for now; a background job
+will replace this endpoint's long-running work as the pipeline grows.
 
 Run the initial test suite with `pytest`.
 

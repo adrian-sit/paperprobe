@@ -1,22 +1,35 @@
-from uuid import UUID, uuid4
+from datetime import datetime
+from uuid import UUID
 
-from pydantic import AnyHttpUrl, BaseModel, Field, model_validator
-
-
-class PaperCreate(BaseModel):
-    """A paper source. Exactly one source is required for ingestion."""
-
-    pdf_url: AnyHttpUrl | None = None
-    openreview_forum_id: str | None = Field(default=None, min_length=1)
-
-    @model_validator(mode="after")
-    def require_one_source(self) -> "PaperCreate":
-        if bool(self.pdf_url) == bool(self.openreview_forum_id):
-            raise ValueError("Provide exactly one of pdf_url or openreview_forum_id.")
-        return self
+from pydantic import BaseModel, Field
 
 
-class PaperIngestionAccepted(BaseModel):
-    paper_id: UUID = Field(default_factory=uuid4)
-    status: str = "queued"
-    detail: str
+class OpenReviewIngestRequest(BaseModel):
+    forum_id: str = Field(min_length=1, description="Public OpenReview v2 forum ID.")
+
+
+class StoredSection(BaseModel):
+    id: UUID
+    position: int
+    heading: str | None
+    content: str
+
+
+class StoredExtractedField(BaseModel):
+    id: UUID
+    field_type: str
+    value: dict
+    extraction_model: str | None
+    prompt_version: str | None
+
+
+class PaperDetail(BaseModel):
+    id: UUID
+    source_type: str
+    source_uri: str
+    title: str | None
+    status: str
+    raw_metadata: dict | None
+    created_at: datetime
+    sections: list[StoredSection]
+    extracted_fields: list[StoredExtractedField]

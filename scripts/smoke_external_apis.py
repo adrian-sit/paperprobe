@@ -9,25 +9,8 @@ import json
 import sys
 from typing import Any
 
-from pydantic import BaseModel, Field
-
 from app.core.config import get_settings
-
-
-class Claim(BaseModel):
-    statement: str
-    evidence_from_abstract: str | None = None
-
-
-class AbstractExtraction(BaseModel):
-    """Conservative fields: absent details are represented by empty lists."""
-
-    summary: str = Field(description="One or two sentences based only on the abstract.")
-    claims: list[Claim] = Field(default_factory=list)
-    methods: list[str] = Field(default_factory=list)
-    datasets: list[str] = Field(default_factory=list)
-    baselines: list[str] = Field(default_factory=list)
-    limitations: list[str] = Field(default_factory=list)
+from app.schemas.extraction import AbstractExtraction
 
 
 def note_content(note: Any, field: str, default: str = "") -> str:
