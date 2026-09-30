@@ -4,29 +4,43 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>PaperProbe</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=activity-1" />
   </head>
   <body>
     <main class="shell">
       <header>
         <p class="eyebrow">PAPERPROBE</p>
         <h1>Read papers critically.</h1>
-        <p class="lede">Fetch an OpenReview paper, inspect its structured extraction, then generate focused discussion questions.</p>
+        <p class="lede">Start with an OpenReview forum ID or upload a paper. PaperProbe extracts its key details, then generates focused discussion questions.</p>
       </header>
 
       <section class="panel intake">
         <div>
-          <h2>Start with an OpenReview forum</h2>
-          <p>Paste the value after <code>forum?id=</code> from a public OpenReview paper URL.</p>
+          <h2>Choose a paper</h2>
+        <p>Enter a public OpenReview forum ID or upload a PDF. Uploads are matched against OpenReview using the paper title.</p>
         </div>
-        <form id="ingest-form">
-          <label for="forum-id">Forum ID</label>
-          <div class="input-row">
-            <input id="forum-id" name="forum-id" required placeholder="e.g. abc123" autocomplete="off" />
-            <button type="submit" id="fetch-button">Fetch and extract</button>
-          </div>
+        <form id="ingest-form" class="source-panel">
+          <h3 class="source-title">Use a forum ID</h3>
+          <p class="hint">Paste the value after <code>forum?id=</code> from an OpenReview URL.</p>
+          <label for="forum-id">OpenReview forum ID</label>
+          <div class="input-row"><input id="forum-id" name="forum-id" required placeholder="e.g. abc123" autocomplete="off" /><button type="submit" id="fetch-button">Fetch and extract</button></div>
+        </form>
+        <form id="upload-form" class="source-panel">
+          <h3 class="source-title">Or upload a paper</h3>
+          <p class="hint">We’ll look for its OpenReview forum ID automatically before analyzing it.</p>
+          <label for="paper-file">Research paper PDF</label>
+          <div class="input-row"><input id="paper-file" name="file" type="file" accept="application/pdf,.pdf" required /><button type="submit" id="upload-button">Upload and analyze</button></div>
+          <p class="hint">PDFs up to 20 MB. Text-based PDFs with a readable abstract work best.</p>
         </form>
         <p class="status" id="status" role="status"></p>
+        <section class="activity" aria-label="Processing activity" hidden>
+          <div class="activity-heading"><h3>Activity</h3><span id="activity-state">Ready</span></div>
+          <div class="detected-title" id="detected-title-panel" hidden>
+            <span>Title detected from PDF</span>
+            <strong id="detected-title"></strong>
+          </div>
+          <ol id="activity-log" aria-live="polite" aria-relevant="additions text"></ol>
+        </section>
       </section>
 
       <section id="paper-view" hidden>
@@ -54,6 +68,6 @@
         </section>
       </section>
     </main>
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=activity-1"></script>
   </body>
 </html>

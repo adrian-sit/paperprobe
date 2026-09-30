@@ -26,13 +26,21 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def prevent_ui_asset_caching(request, call_next):
+        response = await call_next(request)
+        if request.url.path == "/" or request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
     app.include_router(api_router, prefix=settings.api_v1_prefix)
     web_directory = Path(__file__).parent / "web"
     app.mount("/static", StaticFiles(directory=web_directory), name="static")
 
     @app.get("/", include_in_schema=False)
     async def home() -> FileResponse:
-        return FileResponse(web_directory / "index.html")
+        return FileResponse(web_directory / "index.html", headers={"Cache-Control": "no-store"})
 
     return app
 
