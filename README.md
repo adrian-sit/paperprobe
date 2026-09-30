@@ -175,25 +175,27 @@ extracted title. The lookup flow is:
 
 1. PaperProbe extracts the PDF title, abstract, and likely author names from the
    first-page author block, then checks PostgreSQL for the exact PDF (by SHA-256
-   digest). A previously matched PDF can be returned from cache; a PDF-only record
-   is rechecked against OpenReview.
+   digest). Matching uses only the title and author names; the PDF abstract remains
+   available for the PDF-only fallback. A previously matched PDF can be returned
+   from cache; a PDF-only record is rechecked against OpenReview.
 2. It searches OpenReview's title index using the full title and up to eight short,
    overlapping phrases sampled across the title. Results from these searches are
    combined by forum ID.
-3. Before comparison, titles are normalized for case, Unicode accents, punctuation,
-   whitespace, and line-wrap hyphenation. Exact normalized titles score 100%; other
-   candidates are scored using both character-sequence similarity and title-word
-   overlap. When several candidates have the same exact or very close title
-   scores, the extracted PDF authors and abstract are compared with the candidate
-   metadata to help select the right forum. An exact normalized title always meets
-   the title threshold, even when another forum has the same title. A non-exact
-   candidate must score at least 84% and either lead the next title candidate by
-   four percentage points or be clearly preferred by author/abstract evidence.
-   Weak or unresolved fuzzy matches are not selected automatically.
-4. For a selected forum, PaperProbe fetches the canonical OpenReview title and
-   abstract and counts public reviews. If no candidate passes the checks, it keeps
-   using the title and abstract extracted from the PDF. A failed OpenReview request
-   is reported as a lookup problem and also falls back to the PDF.
+3. Titles are normalized for case, Unicode accents, punctuation, whitespace, and
+   line-wrap hyphenation, then scored using character-sequence similarity and
+   title-word overlap. A title score of at least 90% is required; an exact
+   normalized title scores 100% and always passes the title gate. For a non-exact
+   title, author-list similarity must also be at least 30%. This lower author
+   threshold allows a partial author extraction to contribute evidence; an exact
+   title can still match when author extraction is incomplete or unavailable. The
+   uploaded abstract is not used to rank or approve candidates.
+4. Among qualifying candidates, PaperProbe prefers exact-title candidates with
+   author evidence when available, then selects the newest OpenReview true creation
+   date (`tcdate`, falling back to `cdate`). It fetches that forum's current title
+   and abstract and uses those OpenReview fields for Gemini extraction. If no
+   candidate meets the matching rules, it keeps using the uploaded PDF's title and
+   abstract. A failed OpenReview request is reported as a lookup problem and also
+   falls back to the PDF.
 
 Both matched and PDF-only papers continue through the same Gemini extraction and
 question-generation flow. The UI renders extracted fields as cards and lets you
@@ -201,8 +203,8 @@ generate five questions from the stored context. Its live Activity log reports P
 extraction, cache lookup, OpenReview matching, Gemini extraction, database saves,
 and question generation. When matching is declined, it includes the number of
    title phrases searched, candidates returned, and the best candidate title and score
-   when available. The extraction step also shows likely author names, and a match
-   reports its author/abstract comparison score, to help diagnose lookup decisions.
+when available. The extraction step shows likely author names; a match reports the
+author similarity and selected OpenReview version date to help diagnose its choice.
 
 ### Local database administration
 

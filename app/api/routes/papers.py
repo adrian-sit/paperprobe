@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile, status
@@ -33,6 +34,15 @@ from app.services.pdf import extract_title_and_abstract
 
 router = APIRouter()
 MAX_PDF_BYTES = 20 * 1024 * 1024
+
+
+def format_openreview_date(timestamp: int | None) -> str | None:
+    if not timestamp:
+        return None
+    try:
+        return datetime.fromtimestamp(int(timestamp) / 1000, tz=timezone.utc).date().isoformat()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
 
 
 def database_progress_response(operation):
@@ -207,7 +217,7 @@ async def ingest_uploaded_paper(
         try:
             matched = await asyncio.to_thread(
                 find_matching_forum, uploaded.title,
-                authors=uploaded.authors, abstract=uploaded.abstract,
+                authors=uploaded.authors,
             )
         except Exception:
             # OpenReview lookup is opportunistic; the uploaded paper can still be analyzed.
@@ -222,7 +232,9 @@ async def ingest_uploaded_paper(
             title, abstract = matched.title, matched.abstract
             source_type, source_uri = "openreview", matched.source_uri
             metadata = {"forum_id": matched.forum_id, "public_review_count": matched.review_count,
-                        "uploaded_pdf_sha256": digest, "title_match_score": matched.match_score}
+                        "uploaded_pdf_sha256": digest, "title_match_score": matched.match_score,
+                        "author_match_score": matched.author_match_score,
+                        "matched_version_date": matched.version_date}
         else:
             title, abstract = uploaded.title, uploaded.abstract
             source_type, source_uri = "upload", upload_uri
@@ -308,20 +320,23 @@ async def upload_paper_with_progress(
             await report("cache", "Check stored papers", "success", "No previous PDF record found; continuing with this upload.")
         await report("match", "Search OpenReview", "running", "Checking for a forum with the same title.")
         match_diagnostics: dict = {}
+        lookup_error = None
         try:
             matched = await asyncio.to_thread(
                 find_matching_forum, uploaded.title, match_diagnostics,
-                authors=uploaded.authors, abstract=uploaded.abstract,
+                authors=uploaded.authors,
             )
         except Exception as exc:
             matched = None
-            await report("match", "Search OpenReview", "warning", f"Lookup unavailable; continuing with PDF text ({exc}).")
+            lookup_error = str(exc)
         if matched:
             confidence = f" ({matched.match_score:.0%} title similarity)" if matched.match_score is not None else ""
-            evidence = match_diagnostics.get("author_abstract_score")
-            evidence_note = f" Author/abstract comparison: {evidence:.0%}." if evidence is not None else ""
+            evidence = matched.author_match_score
+            evidence_note = f" Author similarity: {evidence:.0%}." if evidence is not None else ""
+            selected_date = format_openreview_date(matched.version_date)
+            date_note = f" Selected newest matching version ({selected_date})." if selected_date else ""
             await report("match", "Search OpenReview", "success",
-                         f"Matched forum {matched.forum_id}{confidence};{evidence_note} using its stored submission.")
+                         f"Matched forum {matched.forum_id}{confidence};{evidence_note}{date_note} Using its OpenReview submission.")
             existing_id = await db.scalar(select(Paper.id).where(Paper.source_uri == matched.source_uri))
             if existing_id:
                 existing = await load_paper(db, existing_id)
@@ -330,23 +345,49 @@ async def upload_paper_with_progress(
             title, abstract = matched.title, matched.abstract
             source_type, source_uri = "openreview", matched.source_uri
             metadata = {"forum_id": matched.forum_id, "public_review_count": matched.review_count,
-                        "uploaded_pdf_sha256": digest, "title_match_score": matched.match_score}
+                        "uploaded_pdf_sha256": digest, "title_match_score": matched.match_score,
+                        "author_match_score": matched.author_match_score,
+                        "matched_version_date": matched.version_date}
         else:
-            detail = (f"Searched {match_diagnostics.get('queries', 0)} title phrases; "
-                      f"OpenReview returned {match_diagnostics.get('candidates', 0)} candidate(s).")
-            if match_diagnostics.get("best_title"):
-                detail += (f" Best candidate: “{match_diagnostics['best_title']}” "
-                           f"({match_diagnostics['best_score']:.0%} title similarity).")
-            if match_diagnostics.get("author_abstract_score") is not None:
-                detail += (f" Author/abstract comparison: "
-                           f"{match_diagnostics['author_abstract_score']:.0%}.")
-            if match_diagnostics.get("query_failures"):
-                detail += f" {len(match_diagnostics['query_failures'])} search request(s) failed."
-            detail += " No candidate met the safe matching threshold; using the uploaded paper."
+            eligible_count = match_diagnostics.get("eligible_versions", 0)
+            candidate_count = match_diagnostics.get("candidates", 0)
+            if lookup_error:
+                if eligible_count:
+                    selected_id = match_diagnostics.get("selected_forum_id") or "the selected forum"
+                    detail = (f"{eligible_count} candidate version(s) met the title/author matching rules, "
+                              f"but OpenReview could not load {selected_id}: {lookup_error}. "
+                              "Continuing with the uploaded PDF.")
+                else:
+                    detail = f"OpenReview lookup failed: {lookup_error}. Continuing with the uploaded PDF."
+            elif match_diagnostics.get("query_failures") and not candidate_count:
+                detail = (f"Search requests failed ({len(match_diagnostics['query_failures'])} error(s)); "
+                          "no matching result could be verified. Continuing with the uploaded PDF.")
+            elif eligible_count:
+                # A defensive path: the matcher should return a fetched paper
+                # whenever it reports eligible versions.
+                detail = (f"{eligible_count} candidate version(s) met the matching rules, but no paper "
+                          "was returned by the matcher. Continuing with the uploaded PDF.")
+            else:
+                detail = (f"Searched {match_diagnostics.get('queries', 0)} title phrases; "
+                          f"OpenReview returned {candidate_count} candidate(s).")
+                if match_diagnostics.get("best_title"):
+                    detail += (f" Best candidate: “{match_diagnostics['best_title']}” "
+                               f"({match_diagnostics['best_score']:.0%} title similarity).")
+                if match_diagnostics.get("best_author_score") is not None:
+                    detail += (f" Best candidate author similarity: "
+                               f"{match_diagnostics['best_author_score']:.0%}.")
+                if not uploaded.authors:
+                    detail += " No PDF author names were extracted; only an exact title can match without author evidence."
+                detail += (" No candidate met the safe matching rules (title ≥90% plus author ≥30%, "
+                           "or exact normalized title); using the uploaded paper.")
+                if match_diagnostics.get("query_failures"):
+                    detail += f" {len(match_diagnostics['query_failures'])} search request(s) failed."
             await report("match", "Search OpenReview", "warning", detail,
                          best_candidate=match_diagnostics.get("best_title"),
                          best_score=match_diagnostics.get("best_score"),
-                         candidate_count=match_diagnostics.get("candidates", 0))
+                         candidate_count=candidate_count,
+                         eligible_versions=eligible_count,
+                         selected_forum_id=match_diagnostics.get("selected_forum_id"))
             title, abstract = uploaded.title, uploaded.abstract
             source_type, source_uri = "upload", upload_uri
             metadata = {"uploaded_filename": file.filename, "uploaded_pdf_sha256": digest,

@@ -22,6 +22,8 @@ class OpenReviewPaper:
     abstract: str
     review_count: int
     match_score: float | None = None
+    author_match_score: float | None = None
+    version_date: int | None = None
 
     @property
     def source_uri(self) -> str:
@@ -63,28 +65,35 @@ def _is_review(note: object) -> bool:
     return any("review" in invitation.lower() for invitation in getattr(note, "invitations", []))
 
 
-def fetch_paper(forum_id: str) -> OpenReviewPaper:
+def fetch_paper(forum_id: str, *, client=None, submission=None) -> OpenReviewPaper:
     """Fetch one public OpenReview v2 submission and count its public reviews."""
-    try:
-        import openreview
-    except ImportError as exc:
-        raise RuntimeError(
-            'OpenReview client is missing. Install with: pip install -e ".[openreview]"'
-        ) from exc
+    if client is None:
+        try:
+            import openreview
+        except ImportError as exc:
+            raise RuntimeError(
+                'OpenReview client is missing. Install with: pip install -e ".[openreview]"'
+            ) from exc
 
-    settings = get_settings()
-    options = {"baseurl": "https://api2.openreview.net"}
-    if settings.openreview_username and settings.openreview_password:
-        options.update(username=settings.openreview_username, password=settings.openreview_password)
-    client = openreview.api.OpenReviewClient(**options)
-    submission = client.get_note(forum_id)
+        settings = get_settings()
+        options = {"baseurl": "https://api2.openreview.net"}
+        if settings.openreview_username and settings.openreview_password:
+            options.update(username=settings.openreview_username, password=settings.openreview_password)
+        client = openreview.api.OpenReviewClient(**options)
+    if submission is None:
+        submission = client.get_note(forum_id)
     title = _content_text(submission, "title")
     abstract = _content_text(submission, "abstract")
     if not title or not abstract:
         content = getattr(submission, "content", {})
         missing_fields = [field for field, value in {"title": title, "abstract": abstract}.items() if not value]
         raise OpenReviewContentError(sorted(content.keys()), missing_fields)
-    reviews = client.get_all_notes(forum=forum_id)
+    # Public review counts are ancillary to matching and paper extraction; an
+    # unavailable review-list endpoint must not discard a valid submission.
+    try:
+        reviews = client.get_all_notes(forum=forum_id)
+    except Exception:
+        reviews = []
     return OpenReviewPaper(
         forum_id=forum_id,
         title=title,
@@ -98,13 +107,13 @@ def find_matching_forum(
     diagnostics: dict | None = None,
     *,
     authors: tuple[str, ...] | list[str] = (),
-    abstract: str = "",
 ) -> OpenReviewPaper | None:
-    """Find an OpenReview submission by title, broadening indexed searches safely.
+    """Find the newest OpenReview version with a strong title and author match.
 
     OpenReview's search endpoint is an index, so a long complete-title query can
     miss indexed notes. Several short, overlapping title phrases improve recall;
-    the complete title is still used to decide whether a candidate is accepted.
+    title and author names are used to identify the paper. The uploaded abstract
+    is deliberately not used as matching evidence.
     """
     try:
         import openreview
@@ -149,7 +158,7 @@ def find_matching_forum(
         queries.append(" ".join(words))
     queries = list(dict.fromkeys(query for query in queries if query.strip()))[:9]
 
-    candidates_by_id: dict[str, dict[str, str | tuple[str, ...]]] = {}
+    candidates_by_id: dict[str, dict[str, object]] = {}
     query_failures = []
     for query in dict.fromkeys(queries):
         try:
@@ -164,7 +173,8 @@ def find_matching_forum(
                 candidates_by_id[forum_id] = {
                     "title": candidate_title,
                     "authors": tuple(_content_values(candidate, "authors")),
-                    "abstract": _content_text(candidate, "abstract"),
+                    "date": getattr(candidate, "tcdate", None) or getattr(candidate, "cdate", None),
+                    "note": candidate,
                 }
 
     def score(candidate_title: str) -> float:
@@ -192,83 +202,116 @@ def find_matching_forum(
                           query_failures=query_failures)
     if not ranked:
         return None
-    best_score, best_forum_id = ranked[0]
-    second_score = ranked[1][0] if len(ranked) > 1 else 0.0
-
-    def evidence_similarity(left: str, right: str) -> float | None:
-        left_normalized, right_normalized = normalize(left), normalize(right)
-        if not left_normalized or not right_normalized:
+    title_threshold = 0.90
+    author_threshold = 0.30
+    strong_title_ids = [forum_id for title_score, forum_id in ranked
+                        if title_score >= title_threshold]
+    def author_similarity(candidate_authors: tuple[str, ...]) -> float | None:
+        expected = [normalize(name) for name in authors if normalize(name)]
+        actual_names = []
+        for name in candidate_authors:
+            parts = re.split(r"\s*;\s*|\s+and\s+", name, flags=re.I)
+            if len(parts) == 1 and name.count(",") >= 1:
+                comma_parts = [part.strip() for part in name.split(",")]
+                # Avoid splitting a single "Last, First" name into two pieces.
+                if len(comma_parts) >= 2 and all(len(part.split()) >= 2 for part in comma_parts):
+                    parts = comma_parts
+            actual_names.extend(parts)
+        actual = [normalize(name) for name in actual_names if normalize(name)]
+        if not expected or not actual:
             return None
-        if left_normalized == right_normalized:
-            return 1.0
-        left_tokens, right_tokens = set(left_normalized.split()), set(right_normalized.split())
-        common = left_tokens & right_tokens
-        precision = len(common) / len(right_tokens)
-        recall = len(common) / len(left_tokens)
-        token_f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-        return 0.4 * SequenceMatcher(None, left_normalized, right_normalized).ratio() + 0.6 * token_f1
 
-    def secondary_score(candidate: dict[str, str | tuple[str, ...]]) -> float | None:
-        evidence = []
-        candidate_authors = candidate["authors"]
-        if authors and candidate_authors:
-            evidence.append((0.6, evidence_similarity(" ".join(authors), " ".join(candidate_authors))))
-        candidate_abstract = str(candidate["abstract"])
-        if abstract and candidate_abstract:
-            evidence.append((0.4, evidence_similarity(abstract, candidate_abstract)))
-        evidence = [(weight, value) for weight, value in evidence if value is not None]
-        if not evidence:
-            return None
-        return sum(weight * value for weight, value in evidence) / sum(weight for weight, _ in evidence)
+        pairs = []
+        for expected_index, expected_name in enumerate(expected):
+            expected_tokens = set(expected_name.split())
+            for actual_index, actual_name in enumerate(actual):
+                actual_tokens = set(actual_name.split())
+                common = expected_tokens & actual_tokens
+                precision = len(common) / len(actual_tokens)
+                recall = len(common) / len(expected_tokens)
+                token_f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+                pair_score = 0.15 * SequenceMatcher(None, expected_name, actual_name).ratio() + 0.85 * token_f1
+                pairs.append((pair_score, expected_index, actual_index))
 
-    exact_ids = [forum_id for title_score, forum_id in ranked
-                 if normalize(str(candidates_by_id[forum_id]["title"])) == wanted]
-    exact_title_match = bool(exact_ids)
-    title_ties = [forum_id for title_score, forum_id in ranked
-                  if best_score - title_score < 0.04]
-    # When title scores tie or are nearly tied, compare the extracted author
-    # list and abstract against candidate metadata to distinguish same-title
-    # submissions. Search results may omit those fields, so fetch only the
-    # close candidates that need enrichment.
-    comparison_ids = exact_ids if exact_title_match else title_ties
-    if len(comparison_ids) > 1 and (authors or abstract):
-        for forum_id in comparison_ids:
-            candidate = candidates_by_id[forum_id]
-            if not candidate["authors"] or not candidate["abstract"]:
-                try:
-                    note = client.get_note(forum_id)
-                    if not candidate["authors"]:
-                        candidate["authors"] = tuple(_content_values(note, "authors"))
-                    if not candidate["abstract"]:
-                        candidate["abstract"] = _content_text(note, "abstract")
-                except Exception as exc:
-                    query_failures.append(f"candidate {forum_id}: {exc}")
+        matched_expected, matched_actual, matched_scores = set(), set(), []
+        for pair_score, expected_index, actual_index in sorted(pairs, reverse=True):
+            if pair_score < 0.5 or expected_index in matched_expected or actual_index in matched_actual:
+                continue
+            matched_expected.add(expected_index)
+            matched_actual.add(actual_index)
+            matched_scores.append(pair_score)
+        precision = len(matched_actual) / len(actual)
+        recall = len(matched_expected) / len(expected)
+        coverage_f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        pair_average = sum(matched_scores) / len(matched_scores) if matched_scores else 0.0
+        return 0.7 * coverage_f1 + 0.3 * pair_average
 
-    secondary = {forum_id: secondary_score(candidates_by_id[forum_id]) for forum_id in comparison_ids}
-    evidenced = [(value, forum_id) for forum_id, value in secondary.items() if value is not None]
-    chosen_forum_id = best_forum_id
-    if evidenced:
-        # Exact-title candidates all satisfy the title threshold. Let author
-        # and abstract evidence select the strongest corresponding forum.
-        chosen_forum_id = max(evidenced, key=lambda item: item[0])[1]
-    chosen_title_score = score(str(candidates_by_id[chosen_forum_id]["title"]))
-    evidence_margin = None
-    if len(evidenced) > 1:
-        secondary_scores = sorted((value for value, _ in evidenced), reverse=True)
-        evidence_margin = secondary_scores[0] - secondary_scores[1]
+    author_scores: dict[str, float | None] = {}
+    version_dates: dict[str, int] = {}
+    exact_title_ids = [forum_id for forum_id in strong_title_ids
+                       if normalize(str(candidates_by_id[forum_id]["title"])) == wanted]
+    for forum_id in strong_title_ids:
+        candidate = candidates_by_id[forum_id]
+        try:
+            # Fetch authoritative author metadata and creation date before
+            # choosing among high-title candidates; search results may omit them.
+            note = client.get_note(forum_id)
+            candidate["note"] = note
+            candidate["title"] = _content_text(note, "title") or candidate["title"]
+            candidate["authors"] = tuple(_content_values(note, "authors")) or candidate["authors"]
+            candidate["date"] = (getattr(note, "tcdate", None)
+                                 or getattr(note, "cdate", None)
+                                 or getattr(note, "tmdate", None)
+                                 or candidate["date"])
+        except Exception as exc:
+            query_failures.append(f"candidate {forum_id}: {exc}")
+        author_scores[forum_id] = author_similarity(tuple(candidate["authors"]))
+        try:
+            version_dates[forum_id] = int(candidate["date"] or 0)
+        except (TypeError, ValueError):
+            version_dates[forum_id] = 0
+
+    if exact_title_ids:
+        author_confirmed_ids = [forum_id for forum_id in exact_title_ids
+                                if (author_scores.get(forum_id) or 0.0) >= author_threshold]
+        # Exact title matches always pass the title gate. Use authors to prefer
+        # matching exact-title versions when that evidence exists, but do not
+        # reject an exact title solely because PDF author extraction was partial.
+        version_pool = author_confirmed_ids or exact_title_ids
+    else:
+        version_pool = [forum_id for forum_id in strong_title_ids
+                        if (author_scores.get(forum_id) or 0.0) >= author_threshold]
+
+    eligible = [(author_scores.get(forum_id), version_dates.get(forum_id, 0), forum_id)
+                for forum_id in version_pool]
+
+    chosen_forum_id = None
+    chosen_title_score = None
+    chosen_author_score = None
+    chosen_date = None
+    if eligible:
+        # Exact titles pass without an author gate. Fuzzy titles must also clear
+        # the author threshold. Among eligible versions, prefer the newest date.
+        chosen_author_score, chosen_date, chosen_forum_id = max(
+            eligible, key=lambda item: (item[1], item[0] or 0.0,
+                                       score(str(candidates_by_id[item[2]]["title"])))
+        )
+        chosen_title_score = score(str(candidates_by_id[chosen_forum_id]["title"]))
 
     if diagnostics is not None:
-        diagnostics.update(best_title=candidates_by_id[chosen_forum_id]["title"],
-                           best_score=chosen_title_score, second_score=second_score,
-                           exact_title_match=exact_title_match,
-                           author_abstract_score=secondary.get(chosen_forum_id),
-                           evidence_margin=evidence_margin)
-    # A 100% normalized title is always above the title threshold. If there
-    # are duplicates, secondary evidence picks the best; absent useful evidence,
-    # the first result for that exact title is still accepted deterministically.
-    if not exact_title_match and chosen_title_score < 0.84:
+        best_title_score, best_title_id = ranked[0]
+        diagnostics.update(queries=len(queries), candidates=len(candidates_by_id),
+                           query_failures=query_failures,
+                           best_title=candidates_by_id[best_title_id]["title"],
+                           best_score=best_title_score,
+                           best_author_score=author_scores.get(best_title_id),
+                           selected_author_score=chosen_author_score,
+                           eligible_versions=len(eligible),
+                           selected_version_date=chosen_date,
+                           selected_forum_id=chosen_forum_id)
+    if chosen_forum_id is None:
         return None
-    if not exact_title_match and chosen_title_score - second_score < 0.04:
-        if evidence_margin is None or evidence_margin < 0.05:
-            return None
-    return replace(fetch_paper(chosen_forum_id), match_score=chosen_title_score)
+    selected_note = candidates_by_id[chosen_forum_id]["note"]
+    return replace(fetch_paper(chosen_forum_id, client=client, submission=selected_note),
+                   match_score=chosen_title_score,
+                   author_match_score=chosen_author_score, version_date=chosen_date)
