@@ -163,8 +163,10 @@ snapshot; PostgreSQL is the queryable application model.
 ## Current data pipeline
 
 1. **Receive and identify the paper.** A user can submit a forum ID directly or
-   upload a PDF. Upload processing extracts title, likely authors, abstract, and
-   complete machine-readable PDF text. The OpenReview search keeps the existing
+   upload a PDF. Upload processing extracts title, likely authors, abstract,
+   and complete machine-readable PDF text. When title or abstract layout
+   detection fails but readable text exists, the upload is still stored with a
+   fallback title and its full text. The OpenReview search keeps the existing
    title/author matching rules: exact normalized title passes; otherwise a title
    match of at least 90% requires at least 30% author similarity. If no forum is
    safely matched, the upload is still stored as a local paper with one version
@@ -175,8 +177,16 @@ snapshot; PostgreSQL is the queryable application model.
    and timestamp. The current submission note is used as the authoritative
    content of the latest revision. Version-specific PDF attachments are
    downloaded and parsed; if an older edit has no attachment reference, its text
-   stays empty rather than incorrectly copying the current revision's PDF.
-   Revision text is not collapsed into one forum-level text field.
+   stays empty rather than incorrectly copying the current revision's PDF. For a
+   referenced PDF, the downloader tries the field-ID route, OpenReview's
+   note-attachment route, and the note-ID PDF route. If all fail or the PDF has
+   no extractable text, forum-ID ingestion continues with that version's
+   available title, abstract, and reviews. Its `paper_text` stays empty and the
+   failure is recorded in version metadata. An uploaded PDF is an independent
+   text source: its extracted full text is always retained and used for the
+   matched forum's latest version, even if OpenReview lookup or PDF retrieval
+   fails. A lookup failure falls back to storing the upload as a local paper.
+   Revision text is not collapsed into one forum-level field.
 3. **Archive raw data first.** The API's raw edit/note JSON is written to MongoDB
    with both forum and revision identifiers. Review notes are also archived and
    tagged to a revision. OpenReview does not explicitly identify the manuscript
@@ -202,11 +212,14 @@ snapshot; PostgreSQL is the queryable application model.
    field. Chunk records are currently populated, while token counts and embeddings
    are left null until an embedding model/job is selected and wired into ingestion.
    This keeps the database ready for semantic retrieval without fabricating vectors.
-7. **Generate questions.** The existing question endpoint continues to use the
-   latest version's abstract and extracted fields, preserving the current
-   generation behavior. Generated questions store both the forum-level paper ID
-   and the exact version ID that supplied the context. The versioned body,
-   reviews, and chunks are now available for future retrieval-based generation.
+7. **Generate questions.** The existing question endpoint uses the latest
+   version's abstract and extracted fields. If forum-ID PDF retrieval fails,
+   this available metadata still supports the existing generation path. Uploaded
+   and fetched PDF text is stored in `paper_text` and `paper_chunks` for local
+   downstream use; it is not currently sent to Gemini. Generated questions store
+   both the forum-level paper ID and the exact version ID that supplied the
+   context. The versioned body, reviews, and chunks are available for future
+   retrieval-based generation.
 
 Uploaded PDFs and PDFs fetched from OpenReview both populate
 `paper_versions.paper_text`. PDF extraction reads embedded text; scanned pages

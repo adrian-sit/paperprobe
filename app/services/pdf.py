@@ -190,11 +190,13 @@ def extract_title_and_abstract(data: bytes) -> UploadedPaper:
         abstract = " ".join(lines[abstract_index + 1:end]).strip()
     else:
         abstract = ""
-    if not title or not abstract:
-        raise ValueError("Could not identify a title and abstract in this PDF. Use a text-based paper with an Abstract section.")
     author_boundary = abstract_index if abstract_index is not None else min(len(lines), 18)
     author_lines = lines[max(0, author_boundary - 14):author_boundary]
     authors = _extract_authors(author_lines, title)
     if not full_text:
         raise ValueError("Could not extract readable text from this PDF.")
+    # Keep a readable upload ingestible even when the layout parser cannot
+    # locate a title block or Abstract heading. The full text remains useful
+    # for storage and local downstream processing.
+    title = title or "Untitled paper"
     return UploadedPaper(title=title, abstract=abstract, authors=authors, full_text=full_text)

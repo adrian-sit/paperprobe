@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+from dataclasses import replace
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from uuid import UUID
@@ -20,10 +21,9 @@ from app.schemas.papers import (
 )
 from app.services.gemini import extract_abstract, generate_questions
 from app.services.openreview import (
-    OpenReviewContentError, OpenReviewPaper, OpenReviewPDFError, fetch_paper,
+    OpenReviewContentError, OpenReviewPaper, fetch_paper,
     find_matching_forum,
 )
-from app.services.openreview_archive import RawArchiveError
 from app.services.pdf import extract_title_and_abstract
 
 router = APIRouter()
@@ -83,7 +83,7 @@ def _serialize(paper: Paper, *, from_cache: bool = False, refreshed: bool = Fals
         versions=[PaperVersionSummary(
             id=v.id, version_key=v.version_key, version_timestamp=v.version_timestamp,
             is_latest=v.is_latest, title=v.title, text_characters=len(v.paper_text or ""),
-            review_count=len(v.reviews),
+            review_count=len(v.reviews), pdf_error=(v.raw_metadata or {}).get("pdf_error"),
         ) for v in sorted(paper.versions, key=lambda v: v.version_timestamp or 0)],
         sections=[StoredSection(id=s.id, position=s.position, heading=s.heading, content=s.content)
                   for s in sorted(latest.sections, key=lambda s: s.position)] if latest else [],
@@ -124,8 +124,14 @@ async def _store(
     paper.status = "completed"
     paper.raw_metadata = {
         **(paper.raw_metadata or {}), **metadata,
-        "full_text_source": "openreview_pdf" if source else "uploaded_pdf",
+        "full_text_source": (
+            next((version.full_text_source for version in source.versions if version.is_latest),
+                 "openreview_pdf") if source else "uploaded_pdf"
+        ),
         "full_text_characters": len(full_text),
+        "pdf_text_missing_versions": [
+            version.version_id for version in source.versions if version.pdf_error and not version.full_text
+        ] if source else [],
     }
     versions = list(source.versions) if source and source.versions else []
     if not versions:
@@ -133,6 +139,7 @@ async def _store(
         versions = [SimpleNamespace(
             version_id=version_key, version_timestamp=None,
             title=title, abstract=abstract, full_text=full_text, is_latest=True, reviews=(),
+            pdf_error=None, full_text_source="uploaded_pdf",
         )]
 
     await db.execute(update(PaperVersion).where(PaperVersion.paper_id == paper.id)
@@ -150,9 +157,11 @@ async def _store(
         version.is_latest = item.is_latest
         version.title = item.title
         version.abstract = item.abstract
-        version.paper_text = item.full_text
+        version.paper_text = item.full_text or None
         version.raw_metadata = {"forum_id": forum_id, "version_id": item.version_id,
-                                "full_text_characters": len(item.full_text or "")}
+                                "full_text_characters": len(item.full_text or ""),
+                                "pdf_error": item.pdf_error,
+                                "full_text_source": item.full_text_source}
         await db.execute(delete(PaperSection).where(PaperSection.paper_version_id == version.id))
         if item.abstract:
             db.add(PaperSection(
@@ -207,9 +216,15 @@ async def _ingest_forum(db: AsyncSession, forum_id: str, report=None) -> PaperDe
                      "Fetching all submission edits and forum notes; raw notes are archived in MongoDB.")
     source = await asyncio.to_thread(fetch_paper, forum_id)
     if report:
-        await report("lookup", "Fetch from OpenReview", "success",
-                     f"Archived versioned notes; loaded {len(source.versions)} revisions and "
-                     f"{sum(len(v.reviews) for v in source.versions)} reviews.")
+        missing_pdf_count = sum(bool(version.pdf_error) for version in source.versions)
+        fetch_state = "warning" if missing_pdf_count else "success"
+        fetch_detail = (f"Archived versioned notes; loaded {len(source.versions)} revisions and "
+                       f"{sum(len(v.reviews) for v in source.versions)} reviews.")
+        if missing_pdf_count:
+            fetch_detail += (f" PDF text was unavailable for {missing_pdf_count} revision(s); "
+                             "continuing with OpenReview title, abstract, and reviews.")
+        await report("lookup", "Fetch from OpenReview", fetch_state,
+                     fetch_detail)
         await report("extraction", "Extract paper fields", "running",
                      "Gemini is extracting structured fields from the latest revision abstract.")
     extraction = await asyncio.to_thread(extract_abstract, source.title, source.abstract)
@@ -280,25 +295,46 @@ async def _ingest_upload(db: AsyncSession, file: UploadFile, data: bytes, report
                      extracted_title=uploaded.title, extracted_authors=list(uploaded.authors))
         await report("match", "Search OpenReview", "running", "Matching title and author evidence to a forum.")
     diagnostics = {}
+    match_error = None
     try:
         matched = await asyncio.to_thread(find_matching_forum, uploaded.title, diagnostics, authors=uploaded.authors)
-    except (RawArchiveError, OpenReviewPDFError):
-        raise
-    except Exception:
+    except Exception as exc:
+        # A failed OpenReview lookup must not discard text already extracted
+        # from the user's PDF. Continue as a local upload in that case.
+        match_error = str(exc)
         matched = None
     if matched:
+        # The upload is the guaranteed source of readable text in this flow.
+        # Keep that text on the matched latest revision even if OpenReview's
+        # PDF endpoint succeeds but returns a different/unusable payload.
+        versions = tuple(
+            replace(version, full_text=uploaded.full_text, full_text_source="uploaded_pdf")
+            if version.is_latest else version
+            for version in matched.versions
+        )
+        matched = replace(matched, full_text=uploaded.full_text, versions=versions)
         if report:
-            await report("match", "Search OpenReview", "success",
-                         f"Matched forum {matched.forum_id} ({matched.match_score or 0:.0%} title similarity); "
-                         f"loaded {len(matched.versions)} revisions and {sum(len(v.reviews) for v in matched.versions)} reviews.")
+            missing_pdf_count = sum(bool(version.pdf_error and not version.full_text)
+                                    for version in matched.versions)
+            detail = (f"Matched forum {matched.forum_id} ({matched.match_score or 0:.0%} title similarity); "
+                      f"loaded {len(matched.versions)} revisions and "
+                      f"{sum(len(v.reviews) for v in matched.versions)} reviews.")
+            if matched.versions and next(v for v in matched.versions if v.is_latest).full_text_source == "uploaded_pdf":
+                detail += " Using the uploaded PDF as the latest revision's full-text source."
+            if missing_pdf_count:
+                detail += (f" PDF text was unavailable for {missing_pdf_count} revision(s); "
+                           "continuing with title, abstract, and reviews.")
+            await report("match", "Search OpenReview", "warning" if missing_pdf_count else "success", detail)
         source, title, abstract, full_text = matched, matched.title, matched.abstract, matched.full_text
         source_uri, source_type = matched.source_uri, "openreview"
         metadata = {"forum_id": matched.forum_id, "uploaded_pdf_sha256": digest,
                     "title_match_score": matched.match_score, "author_match_score": matched.author_match_score}
     else:
         if report:
-            await report("match", "Search OpenReview", "warning",
-                         "No safe forum match was found; continuing with the uploaded paper.",
+            detail = "No safe forum match was found; continuing with the uploaded paper."
+            if match_error:
+                detail = f"OpenReview lookup failed ({match_error}); continuing with the uploaded paper."
+            await report("match", "Search OpenReview", "warning", detail,
                          best_candidate=diagnostics.get("best_title"), best_score=diagnostics.get("best_score"))
         source, title, abstract, full_text = None, uploaded.title, uploaded.abstract, uploaded.full_text
         source_uri, source_type = f"paperprobe-upload://sha256/{digest}", "upload"
@@ -417,6 +453,7 @@ async def get_paper_version(paper_id: UUID, version_id: UUID,
         id=version.id, paper_id=version.paper_id, version_key=version.version_key,
         version_timestamp=version.version_timestamp, is_latest=version.is_latest,
         title=version.title, abstract=version.abstract, paper_text=version.paper_text,
+        pdf_error=(version.raw_metadata or {}).get("pdf_error"),
         extracted_fields=[StoredExtractedField(
             id=f.id, field_type=f.field_type, value=f.value,
             extraction_model=f.extraction_model, prompt_version=f.prompt_version,

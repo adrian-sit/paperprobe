@@ -31,6 +31,7 @@ class PaperVersionSummary(BaseModel):
     title: str | None
     text_characters: int
     review_count: int
+    pdf_error: str | None = None
 
 
 class StoredReview(BaseModel):
@@ -50,6 +51,7 @@ class PaperVersionDetail(BaseModel):
     title: str | None
     abstract: str | None
     paper_text: str | None
+    pdf_error: str | None = None
     extracted_fields: list[StoredExtractedField]
     reviews: list[StoredReview]
 

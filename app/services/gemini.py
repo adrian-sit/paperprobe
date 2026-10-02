@@ -2,8 +2,8 @@ from app.core.config import get_settings
 from app.schemas.extraction import AbstractExtraction, QuestionGeneration
 
 
-def extract_abstract(title: str, abstract: str) -> AbstractExtraction:
-    """Generate a schema-constrained extraction using only title and abstract."""
+def extract_abstract(title: str, abstract: str, paper_text: str = "") -> AbstractExtraction:
+    """Extract structured fields from the full text when available, else metadata."""
     try:
         from google import genai
         from google.genai import types
@@ -18,9 +18,11 @@ def extract_abstract(title: str, abstract: str) -> AbstractExtraction:
     response = client.models.generate_content(
         model=settings.gemini_model,
         contents=(
-            "Extract information only if it is supported by this research-paper title "
-            "and abstract. Use empty lists for details not stated.\n\n"
-            f"Title: {title}\n\nAbstract:\n{abstract}"
+            "Extract information only if supported by the supplied research-paper context. "
+            "Use empty lists for details not stated. Prefer the complete paper text when it "
+            "is provided; otherwise use the title and abstract.\n\n"
+            f"Title: {title}\n\nAbstract:\n{abstract or '(not available)'}"
+            + (f"\n\nFull paper text:\n{paper_text}" if paper_text.strip() else "")
         ),
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -34,7 +36,8 @@ def extract_abstract(title: str, abstract: str) -> AbstractExtraction:
 
 
 def generate_questions(
-    title: str, abstract: str, extracted_fields: dict[str, dict], count: int
+    title: str, abstract: str, extracted_fields: dict[str, dict], count: int,
+    paper_text: str = "",
 ) -> QuestionGeneration:
     """Generate critical discussion questions from the currently stored paper context."""
     try:
@@ -53,12 +56,16 @@ def generate_questions(
         "abstract": abstract,
         "extracted_fields": extracted_fields,
     }
+    if paper_text.strip():
+        context["paper_text"] = paper_text
     response = client.models.generate_content(
         model=settings.gemini_model,
         contents=(
             f"Generate exactly {count} distinct, thoughtful peer-review discussion questions. "
             "Each question must be specific, answerable, critical when appropriate, and grounded "
-            "only in the supplied paper context. Do not invent study details or cite outside work.\n\n"
+            "only in the supplied paper context. Use full paper text when present; if absent, "
+            "rely on the available title, abstract, and extracted fields. Do not invent study "
+            "details or cite outside work.\n\n"
             f"Paper context:\n{context}"
         ),
         config=types.GenerateContentConfig(

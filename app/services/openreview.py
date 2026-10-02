@@ -48,6 +48,8 @@ class OpenReviewVersion:
     full_text: str
     is_latest: bool
     reviews: tuple[OpenReviewReview, ...] = ()
+    pdf_error: str | None = None
+    full_text_source: str = "openreview_pdf"
 
 
 @dataclass(frozen=True)
@@ -218,11 +220,17 @@ def _pdf_identifier(note: dict[str, Any]) -> str | None:
         return None
     value = value.strip()
     parsed = urlparse(value)
+    path = parsed.path.rstrip("/")
     query_id = parse_qs(parsed.query).get("id")
-    if query_id:
-        value = query_id[0]
-    elif "/pdf/" in parsed.path:
-        value = parsed.path.split("/pdf/", 1)[1].strip("/")
+    if path.endswith("/pdf") or path.endswith("/attachment"):
+        # These routes take a Note id, not the PDF field's opaque file id.
+        # Leave resolution to the note-ID attachment fallbacks below.
+        return None
+    if "/pdf/" in path:
+        value = path.split("/pdf/", 1)[1]
+    elif query_id:
+        # Do not turn /attachment?id=<note-id> into /pdf/<note-id>.
+        return None
     return value or None
 
 
@@ -297,26 +305,62 @@ def _raw_api_notes(client: Any, forum_id: str) -> tuple[dict[str, Any], list[dic
     return submission, replies
 
 
-def _openreview_pdf_text(client: Any, note_id: str, pdf_id: str | None = None) -> str:
-    """Download and extract all pages from one OpenReview revision's PDF."""
+def _openreview_pdf_text(
+    client: Any, note_id: str, pdf_id: str | None = None, *, allow_note_fallback: bool = True
+) -> str:
+    """Try OpenReview's PDF and attachment routes, returning extracted text."""
     api_root = client.notes_url.rsplit("/", 1)[0]
-    pdf_url = f"{api_root}/pdf/{quote(pdf_id, safe='')}" if pdf_id else f"{api_root}/pdf"
-    try:
-        params = None if pdf_id else {"id": note_id}
-        response = client.session.get(pdf_url, params=params, headers=client.headers, timeout=60)
-        response.raise_for_status()
-        pdf_bytes = response.content
-        if not pdf_bytes.startswith(b"%PDF"):
-            raise OpenReviewPDFError(
-                f"OpenReview did not return a PDF for submission {note_id}."
-            )
-        return extract_pdf_text(pdf_bytes)
-    except OpenReviewPDFError:
-        raise
-    except Exception as exc:
-        raise OpenReviewPDFError(
-            f"Could not download or extract the OpenReview PDF for submission {note_id}: {exc}"
-        ) from exc
+    attempts = []
+    if pdf_id:
+        pdf_url = f"{api_root}/pdf/{quote(pdf_id, safe='')}"
+        attempts.append((f"PDF field id ({pdf_url})", lambda: client.session.get(
+            pdf_url, headers=client.headers, timeout=60
+        )))
+
+    if allow_note_fallback:
+        get_attachment = getattr(client, "get_attachment", None)
+        if callable(get_attachment):
+            attempts.append(("note attachment (get_attachment)", lambda: get_attachment(
+                field_name="pdf", id=note_id
+            )))
+        else:
+            attachment_url = f"{api_root}/attachment"
+            attempts.append((f"note attachment ({attachment_url})", lambda: client.session.get(
+                attachment_url, params={"id": note_id, "name": "pdf"},
+                headers=client.headers, timeout=60,
+            )))
+
+        get_pdf = getattr(client, "get_pdf", None)
+        if callable(get_pdf):
+            attempts.append(("note PDF (get_pdf)", lambda: get_pdf(id=note_id)))
+        else:
+            pdf_url = f"{api_root}/pdf"
+            attempts.append((f"note PDF ({pdf_url}?id=...)", lambda: client.session.get(
+                pdf_url, params={"id": note_id}, headers=client.headers, timeout=60
+            )))
+
+    failures = []
+    for label, download in attempts:
+        try:
+            result = download()
+            if hasattr(result, "raise_for_status"):
+                result.raise_for_status()
+                pdf_bytes = result.content
+            else:
+                pdf_bytes = result
+            if not isinstance(pdf_bytes, bytes) or not pdf_bytes.startswith(b"%PDF"):
+                raise ValueError("response did not contain PDF bytes")
+            text = extract_pdf_text(pdf_bytes)
+            if not text.strip():
+                raise ValueError("PDF contained no extractable text")
+            return text
+        except Exception as exc:
+            failures.append(f"{label}: {exc}")
+
+    raise OpenReviewPDFError(
+        f"Could not download or extract PDF for OpenReview note {note_id}; "
+        f"tried {len(attempts)} method(s): {'; '.join(failures)}"
+    )
 
 
 def fetch_paper(forum_id: str, *, client=None) -> OpenReviewPaper:
@@ -400,21 +444,31 @@ def fetch_paper(forum_id: str, *, client=None) -> OpenReviewPaper:
         ))
 
     text_by_pdf: dict[str, str] = {}
+    pdf_errors: dict[str, str] = {}
     versions: list[OpenReviewVersion] = []
     for version_id, timestamp, state, _edit in snapshots:
         pdf_id = _pdf_identifier(state)
         pdf_cache_key = pdf_id or str(state.get("id") or forum_id)
+        pdf_error = None
         if pdf_id is None and version_id != latest_version_id:
             # The /pdf?id=<note> form resolves the current attachment. Do not
             # mislabel that current PDF as the text of an older edit that had
             # no attachment reference of its own.
             version_text = ""
-        elif pdf_cache_key not in text_by_pdf:
-            text_by_pdf[pdf_cache_key] = _openreview_pdf_text(
-                client, str(state.get("id") or forum_id), pdf_id
-            )
-            version_text = text_by_pdf[pdf_cache_key]
+            pdf_error = "No revision-specific PDF reference was available; skipped to avoid using the latest PDF."
         else:
+            if pdf_cache_key not in text_by_pdf:
+                try:
+                    text_by_pdf[pdf_cache_key] = _openreview_pdf_text(
+                        client, str(state.get("id") or forum_id), pdf_id,
+                        allow_note_fallback=version_id == latest_version_id,
+                    )
+                except OpenReviewPDFError as exc:
+                    pdf_error = str(exc)
+                    pdf_errors[pdf_cache_key] = pdf_error
+                    text_by_pdf[pdf_cache_key] = ""
+            elif not text_by_pdf[pdf_cache_key]:
+                pdf_error = pdf_errors.get(pdf_cache_key, "The referenced PDF could not be extracted.")
             version_text = text_by_pdf[pdf_cache_key]
         versions.append(OpenReviewVersion(
             version_id=version_id,
@@ -424,6 +478,7 @@ def fetch_paper(forum_id: str, *, client=None) -> OpenReviewPaper:
             full_text=version_text,
             is_latest=version_id == latest_version_id,
             reviews=tuple(archived_reviews.get(version_id, [])),
+            pdf_error=pdf_error,
         ))
 
     latest = next(version for version in versions if version.is_latest)
