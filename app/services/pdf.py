@@ -9,6 +9,21 @@ class UploadedPaper:
     title: str
     abstract: str
     authors: tuple[str, ...] = ()
+    full_text: str = ""
+
+
+def extract_pdf_text(data: bytes) -> str:
+    """Extract all readable page text from a PDF, keeping page order."""
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:
+        raise RuntimeError("PDF support is missing. Install the project dependencies.") from exc
+    reader = PdfReader(BytesIO(data))
+    pages = [page.extract_text() or "" for page in reader.pages]
+    full_text = "\n\n".join(page.strip() for page in pages if page.strip())
+    if not full_text:
+        raise ValueError("Could not extract readable text from this PDF.")
+    return full_text
 
 
 def _clean_title(value: str | None) -> str:
@@ -145,8 +160,9 @@ def extract_title_and_abstract(data: bytes) -> UploadedPaper:
     except ImportError as exc:
         raise RuntimeError("PDF support is missing. Install the project dependencies.") from exc
     reader = PdfReader(BytesIO(data))
-    first_page_text = reader.pages[0].extract_text() or "" if reader.pages else ""
-    text = "\n".join([first_page_text, *(page.extract_text() or "" for page in reader.pages[1:8])])
+    page_texts = [page.extract_text() or "" for page in reader.pages]
+    text = "\n".join(page_texts[:8])
+    full_text = "\n\n".join(page.strip() for page in page_texts if page.strip())
     lines = [" ".join(line.split()) for line in text.splitlines() if line.strip()]
     abstract_index = next(
         (i for i, line in enumerate(lines) if line.casefold().strip(" :") == "abstract"), None
@@ -179,4 +195,6 @@ def extract_title_and_abstract(data: bytes) -> UploadedPaper:
     author_boundary = abstract_index if abstract_index is not None else min(len(lines), 18)
     author_lines = lines[max(0, author_boundary - 14):author_boundary]
     authors = _extract_authors(author_lines, title)
-    return UploadedPaper(title=title, abstract=abstract, authors=authors)
+    if not full_text:
+        raise ValueError("Could not extract readable text from this PDF.")
+    return UploadedPaper(title=title, abstract=abstract, authors=authors, full_text=full_text)

@@ -127,86 +127,92 @@ OpenReview match is found. Do not store credentials in committed files.
 
 ### Local PostgreSQL
 
-Docker Desktop is used only to run PostgreSQL locally; the application schema is
-created by Alembic migrations. Ensure `.env` contains the `POSTGRES_*` values in
-`.env.example`, then run:
+Docker Compose starts PostgreSQL with pgvector support. Configure `.env` from
+`.env.example`, including the PostgreSQL DSN, MongoDB settings, and Gemini API
+key, then run:
 
 ```powershell
-docker compose up -d postgres
+docker compose up -d postgres mongodb
 .\.venv\Scripts\alembic upgrade head
 docker compose exec postgres psql -U paperprobe -d paperprobe -c "\dt"
 ```
 
-This creates `papers`, `paper_sections`, `extracted_fields`, and `questions`.
-Future schema changes should be new Alembic revisions, generated after changing
-the SQLAlchemy models with:
+Alembic creates the forum/revision tables and enables the PostgreSQL `vector`
+extension. Existing pre-versioning rows are migrated into one `legacy` paper
+version, including their abstract and any saved full text. New schema changes
+should be added as migrations and applied with `alembic upgrade head`.
 
-```powershell
-.\.venv\Scripts\alembic revision --autogenerate -m "describe the change"
-.\.venv\Scripts\alembic upgrade head
-```
+### Local MongoDB raw archive
 
-### Local MongoDB for raw OpenReview data
-
-MongoDB stores the raw JSON Note objects returned for the selected forum before
-the app maps the submission title and abstract or counts its reviews. Start both
-local databases from the repository root:
-
-```powershell
-docker compose up -d postgres mongodb
-docker compose ps
-```
-
-The default `.env.example` points the app at `mongodb://localhost:27017`, database
-`paperprobe`, collection `openreview_raw_notes`. Change `MONGODB_URI` if MongoDB
-runs elsewhere. Documents include the untouched note payload plus archive
-metadata (`forum_id`, `note_id`, note role, fetch time, payload hash, and archive
-schema version). Identical note payloads are idempotent; when a note changes, the
-new hash produces a separate document so older snapshots remain available.
-Indexes support reading snapshots by forum and note ID. To inspect the count:
+MongoDB retains the original OpenReview API documents before they are normalized.
+Each document has `forum_id`, `version_id`, `version_timestamp`, `note_id`,
+`record_type` (`submission_edit`, `submission_note`, or `review`), fetch time,
+and a payload hash. The archive key includes forum, version, record type, note,
+and content hash, so edits do not overwrite each other and changed note payloads
+remain recoverable. Review documents also carry the version assignment used by
+the relational layer.
 
 ```powershell
 docker compose exec mongodb mongosh paperprobe --eval 'db.openreview_raw_notes.countDocuments()'
 ```
 
-Mongo keeps the complete source Note JSON, including fields the current pipeline
-does not interpret. The archive can be read with
-`app.services.openreview_archive.load_archived_openreview_notes(forum_id)` for
-future extraction or migration jobs. Existing PostgreSQL cache hits do not fetch
-OpenReview again; use the database administration `reconcile` command to refresh
-a stored paper and create a raw archive snapshot for it.
+Use `app.services.openreview_archive.load_archived_openreview_notes(forum_id,
+version_id)` to read the preserved source records. MongoDB is the raw source
+snapshot; PostgreSQL is the queryable application model.
 
 ## Current data pipeline
 
-1. **Receive a source.** The user enters an OpenReview forum ID or uploads a PDF.
-   For a PDF, PaperProbe extracts its title, abstract, and likely author names.
-2. **Find the OpenReview paper.** The upload path searches candidate titles and
-   applies the title and author matching rules below. If no candidate qualifies,
-   the uploaded title and abstract remain the source. A direct forum ID skips
-   matching. Candidate title and author metadata is used in memory for this
-   decision; the selected forum's full notes are fetched and archived next.
-3. **Fetch and archive raw OpenReview data.** For a selected forum, PaperProbe
-   fetches the submission and paginated forum notes as API JSON. It writes each
-   raw Note object to MongoDB before mapping the selected submission into the
-   relational/Gemini pipeline.
-   Archive failure stops OpenReview ingestion. MongoDB is the source snapshot
-   layer; it preserves unknown fields so a later process can extract them
-   without relying on OpenReview to still return the same data.
-4. **Normalize and enrich.** After the archive succeeds, the app reads the
-   submission title and abstract, counts public review notes, and sends the
-   abstract to Gemini for structured fields such as claims, methods, datasets,
-   baselines, and limitations.
-5. **Save relational results.** PostgreSQL stores the canonical paper record,
-   abstract section, extracted fields, and generated questions in relational
-   tables. Paper metadata records the raw archive count and fetch time.
-6. **Generate questions.** The question endpoint loads the stored abstract and
-   extracted fields from PostgreSQL, asks Gemini to draft questions, and saves
-   them back to PostgreSQL. Future jobs can instead reload a Mongo raw snapshot
-   and derive additional fields while keeping the original JSON intact.
+1. **Receive and identify the paper.** A user can submit a forum ID directly or
+   upload a PDF. Upload processing extracts title, likely authors, abstract, and
+   complete machine-readable PDF text. The OpenReview search keeps the existing
+   title/author matching rules: exact normalized title passes; otherwise a title
+   match of at least 90% requires at least 30% author similarity. If no forum is
+   safely matched, the upload is still stored as a local paper with one version
+   keyed by its PDF digest and no OpenReview edit timestamp.
+2. **Fetch the forum history.** For a matched forum, PaperProbe requests the
+   submission and its edit history, plus the paginated forum notes. Each distinct
+   submission edit is treated as a revision identified by its OpenReview edit ID
+   and timestamp. The current submission note is used as the authoritative
+   content of the latest revision. Version-specific PDF attachments are
+   downloaded and parsed; if an older edit has no attachment reference, its text
+   stays empty rather than incorrectly copying the current revision's PDF.
+   Revision text is not collapsed into one forum-level text field.
+3. **Archive raw data first.** The API's raw edit/note JSON is written to MongoDB
+   with both forum and revision identifiers. Review notes are also archived and
+   tagged to a revision. OpenReview does not explicitly identify the manuscript
+   revision a review critiques, so PaperProbe assigns each review to the latest
+   submission edit timestamp at or before the review's creation timestamp; if
+   timestamps are unavailable or precede all edits, it assigns the earliest
+   known revision. This is a documented timestamp-based association.
+4. **Normalize into PostgreSQL.** `papers` has one row for a forum (or a local
+   upload without a forum ID). `paper_versions` stores one row per revision,
+   with version key, timestamp, `is_latest`, title, abstract, and complete
+   `paper_text`. A unique forum ID prevents duplicate forum roots. Re-ingesting
+   a forum refreshes its existing versions and reviews so newly posted revisions
+   and reviews are discovered; it does not short-circuit on a cached paper.
+5. **Attach version-dependent data.** `extracted_fields` references a version,
+   and the current Gemini extraction runs against the latest version's abstract.
+   `reviews` stores review text read back from the Mongo archive, along with
+   raw content and OpenReview note metadata. Review rows reference the assigned
+   version. `paper_sections` and `questions` also retain their version link.
+6. **Prepare full text for retrieval.** Every version's `paper_text` is split
+   into overlapping chunks in `paper_chunks` (about 3,000 characters per chunk
+   with a 300-character overlap, preferring nearby paragraph/sentence boundaries).
+   The table has a pgvector `embedding vector(768)` column and an embedding-model
+   field. Chunk records are currently populated, while token counts and embeddings
+   are left null until an embedding model/job is selected and wired into ingestion.
+   This keeps the database ready for semantic retrieval without fabricating vectors.
+7. **Generate questions.** The existing question endpoint continues to use the
+   latest version's abstract and extracted fields, preserving the current
+   generation behavior. Generated questions store both the forum-level paper ID
+   and the exact version ID that supplied the context. The versioned body,
+   reviews, and chunks are now available for future retrieval-based generation.
 
-The separation is intentional: MongoDB retains the source-shaped data for
-reprocessing; PostgreSQL holds the smaller, validated schema used by the current
-application and UI.
+Uploaded PDFs and PDFs fetched from OpenReview both populate
+`paper_versions.paper_text`. PDF extraction reads embedded text; scanned pages
+that need OCR are not currently recognized. MongoDB preserves source-shaped
+OpenReview JSON for future extraction, while PostgreSQL stores version-linked
+text, review records, structured fields, and retrieval chunks.
 
 ## Usage
 
@@ -223,25 +229,25 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/v1/papers/openrevi
   -Body '{"forum_id":"<public-openreview-forum-id>"}'
 ```
 
-The response contains the persisted paper ID. Retrieve it with
-`GET /api/v1/papers/{paper_id}`. The initial flow fetches title and abstract,
-uses Gemini to produce structured fields, and saves the abstract plus each
-extraction field in PostgreSQL. It is synchronous for now; a background job
-will replace this endpoint's long-running work as the pipeline grows.
+The response contains the persisted forum-level paper ID. Retrieve the latest
+revision with `GET /api/v1/papers/{paper_id}` or a particular revision, including
+its full text, extracted fields, and reviews, with
+`GET /api/v1/papers/{paper_id}/versions/{version_id}`.
 
-Submitting the same forum ID again returns the stored record immediately with
-`from_cache: true`; it does not call OpenReview or Gemini again. A new paper
-returns HTTP 201, while a cached paper returns HTTP 200.
+Submitting the same forum ID again refreshes the OpenReview edit and review
+history, upserts the versions, and re-runs extraction on the latest abstract so
+newer API data is discovered. The endpoint returns the existing paper identity
+when one is already stored.
 
 Open `http://127.0.0.1:8000/` for the browser interface. Enter a forum ID or upload
 a text-based PDF (up to 20 MB). Uploads are searched against OpenReview using the
-extracted title. The lookup flow is:
+extracted title and likely author names. A match stores all fetched revisions
+under one forum record; otherwise, the PDF is stored as a one-version local paper.
 
 1. PaperProbe extracts the PDF title, abstract, and likely author names from the
    first-page author block, then checks PostgreSQL for the exact PDF (by SHA-256
-   digest). Matching uses only the title and author names; the PDF abstract remains
-   available for the PDF-only fallback. A previously matched PDF can be returned
-   from cache; a PDF-only record is rechecked against OpenReview.
+   digest). The PDF abstract is retained for local processing but does not rank
+   OpenReview matches.
 2. It searches OpenReview's title index using the full title and up to eight short,
    overlapping phrases sampled across the title. Results from these searches are
    combined by forum ID.
@@ -254,21 +260,18 @@ extracted title. The lookup flow is:
    title can still match when author extraction is incomplete or unavailable. The
    uploaded abstract is not used to rank or approve candidates.
 4. Among qualifying candidates, PaperProbe prefers exact-title candidates with
-   author evidence when available, then selects the newest OpenReview true creation
-   date (`tcdate`, falling back to `cdate`). It fetches that forum's current title
-   and abstract and uses those OpenReview fields for Gemini extraction. If no
-   candidate meets the matching rules, it keeps using the uploaded PDF's title and
-   abstract. A failed OpenReview request is reported as a lookup problem and also
-   falls back to the PDF.
+   author evidence when available, then selects the newest forum creation date
+   (`tcdate`, falling back to `cdate`). It fetches that forum's edit history and
+   all its revisions; Gemini uses the latest revision's abstract. If no candidate
+   qualifies, it uses the uploaded PDF's title and abstract.
 
 Both matched and PDF-only papers continue through the same Gemini extraction and
 question-generation flow. The UI renders extracted fields as cards and lets you
 generate five questions from the stored context. Its live Activity log reports PDF
-extraction, cache lookup, OpenReview matching, Gemini extraction, database saves,
-and question generation. When matching is declined, it includes the number of
-   title phrases searched, candidates returned, and the best candidate title and score
-when available. The extraction step shows likely author names; a match reports the
-author similarity and selected OpenReview version date to help diagnose its choice.
+extraction, OpenReview matching, Gemini extraction, database saves, and question
+generation. Forum ingestion reports whether a paper was already stored and then
+refreshes its revision/review history. Upload activity shows the extracted title
+and authors and reports the best candidate title and score when matching fails.
 
 ### Local database administration
 
@@ -276,22 +279,22 @@ Use the local CLI to inspect stored records and repair an uploaded record that
 was initially stored without its OpenReview match:
 
 ```powershell
-..venv\Scripts\python.exe scripts\db_admin.py status
-..venv\Scripts\python.exe scripts\db_admin.py list
-..venv\Scripts\python.exe scripts\db_admin.py show <paper-id>
-..venv\Scripts\python.exe scripts\db_admin.py reconcile <paper-id>
+.\.venv\Scripts\python.exe scripts\db_admin.py status
+.\.venv\Scripts\python.exe scripts\db_admin.py list
+.\.venv\Scripts\python.exe scripts\db_admin.py show <paper-id>
+.\.venv\Scripts\python.exe scripts\db_admin.py reconcile <paper-id>
 ```
 
-`reconcile` searches by the stored title; if that title is poor or the search is
-ambiguous, provide the known forum ID with `--forum-id <forum-id>`. It previews
-the OpenReview title and asks for a paper-specific confirmation before changing
-the stored source, abstract, and extracted fields. Existing questions are kept
-but marked `stale`, since they were generated from the previous paper context.
-Gemini must be configured for the refreshed extraction.
+`reconcile` uses the stored forum ID when present. Otherwise it searches by the
+stored title; provide `--forum-id <forum-id>` when the title search is poor or
+ambiguous. It asks for confirmation, then refreshes all versions and reviews.
+Existing questions are kept but marked `stale` because the latest paper context
+may have changed. Gemini must be configured for refreshed extraction.
 
 The CLI also supports `delete <paper-id>` and `reset`. Both require typing an
-explicit confirmation phrase. Reset removes rows from PaperProbe's four data
-tables while preserving PostgreSQL itself and the Alembic schema.
+explicit confirmation phrase. `show` reports revision keys, timestamps, text
+sizes, review counts, and chunk counts. Deletes cascade through all version-level
+records; reset preserves PostgreSQL itself and the Alembic schema.
 
 Run the initial test suite with `pytest`.
 
