@@ -1,9 +1,12 @@
 import re
 import unicodedata
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
+from typing import Any
 
 from app.core.config import get_settings
+from app.services.openreview_archive import archive_openreview_notes
 
 
 class OpenReviewContentError(ValueError):
@@ -24,6 +27,8 @@ class OpenReviewPaper:
     match_score: float | None = None
     author_match_score: float | None = None
     version_date: int | None = None
+    raw_note_count: int = 0
+    raw_fetched_at: datetime | None = None
 
     @property
     def source_uri(self) -> str:
@@ -40,7 +45,7 @@ def _content_text(note: object, field: str) -> str:
 
 
 def _content_values(note: object, field: str) -> list[str]:
-    content = getattr(note, "content", {})
+    content = note.get("content", {}) if isinstance(note, dict) else getattr(note, "content", {})
     value = content.get(field, "")
     if isinstance(value, str):
         return [value.strip()] if value.strip() else []
@@ -62,43 +67,103 @@ def _content_values(note: object, field: str) -> list[str]:
 
 
 def _is_review(note: object) -> bool:
-    return any("review" in invitation.lower() for invitation in getattr(note, "invitations", []))
+    invitations = (
+        note.get("invitations", []) if isinstance(note, dict)
+        else getattr(note, "invitations", [])
+    )
+    return any(
+        isinstance(invitation, str) and "review" in invitation.lower()
+        for invitation in invitations
+    )
 
 
-def fetch_paper(forum_id: str, *, client=None, submission=None) -> OpenReviewPaper:
-    """Fetch one public OpenReview v2 submission and count its public reviews."""
+def _make_client():
+    try:
+        import openreview
+    except ImportError as exc:
+        raise RuntimeError(
+            'OpenReview client is missing. Install with: pip install -e ".[openreview]"'
+        ) from exc
+
+    settings = get_settings()
+    options = {"baseurl": "https://api2.openreview.net"}
+    if settings.openreview_username and settings.openreview_password:
+        options.update(username=settings.openreview_username, password=settings.openreview_password)
+    return openreview.api.OpenReviewClient(**options)
+
+
+def _raw_api_notes(client: Any, forum_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Fetch the original JSON objects through the v2 client session."""
+
+    def get_page(params: dict[str, Any]) -> tuple[list[dict[str, Any]], int | None]:
+        response = client.session.get(
+            client.notes_url, params=params, headers=client.headers, timeout=30
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError("OpenReview returned an invalid notes response.")
+        notes = payload.get("notes", [])
+        if not isinstance(notes, list):
+            raise RuntimeError("OpenReview returned an invalid notes response.")
+        count = payload.get("count")
+        return (
+            [note for note in notes if isinstance(note, dict)],
+            count if isinstance(count, int) else None,
+        )
+
+    submissions, _ = get_page({"id": forum_id, "limit": 1})
+    if not submissions:
+        raise LookupError(f"OpenReview returned no submission for forum {forum_id}.")
+    submission = submissions[0]
+
+    replies: list[dict[str, Any]] = []
+    offset = 0
+    page_size = 100
+    while True:
+        page, total = get_page({"forum": forum_id, "limit": page_size, "offset": offset})
+        if not page:
+            break
+        replies.extend(page)
+        offset += len(page)
+        if total is not None and offset >= total:
+            break
+        if len(page) < page_size and total is None:
+            break
+    submission_id = submission.get("id")
+    replies = [note for note in replies if note.get("id") != submission_id]
+    return submission, replies
+
+
+def fetch_paper(forum_id: str, *, client=None) -> OpenReviewPaper:
+    """Archive raw v2 notes, then normalize the submission for the current pipeline."""
     if client is None:
-        try:
-            import openreview
-        except ImportError as exc:
-            raise RuntimeError(
-                'OpenReview client is missing. Install with: pip install -e ".[openreview]"'
-            ) from exc
+        client = _make_client()
+    submission, replies = _raw_api_notes(client, forum_id)
+    fetched_at = datetime.now(timezone.utc)
+    raw_notes = [("submission", submission)]
+    raw_notes.extend(("reply", note) for note in replies)
+    raw_note_count = archive_openreview_notes(
+        forum_id,
+        fetched_at,
+        raw_notes,
+    )
 
-        settings = get_settings()
-        options = {"baseurl": "https://api2.openreview.net"}
-        if settings.openreview_username and settings.openreview_password:
-            options.update(username=settings.openreview_username, password=settings.openreview_password)
-        client = openreview.api.OpenReviewClient(**options)
-    if submission is None:
-        submission = client.get_note(forum_id)
     title = _content_text(submission, "title")
     abstract = _content_text(submission, "abstract")
     if not title or not abstract:
-        content = getattr(submission, "content", {})
-        missing_fields = [field for field, value in {"title": title, "abstract": abstract}.items() if not value]
+        content = submission.get("content", {})
+        missing_fields = [
+            field for field, value in {"title": title, "abstract": abstract}.items() if not value
+        ]
         raise OpenReviewContentError(sorted(content.keys()), missing_fields)
-    # Public review counts are ancillary to matching and paper extraction; an
-    # unavailable review-list endpoint must not discard a valid submission.
-    try:
-        reviews = client.get_all_notes(forum=forum_id)
-    except Exception:
-        reviews = []
     return OpenReviewPaper(
         forum_id=forum_id,
         title=title,
         abstract=abstract,
-        review_count=sum(_is_review(reply) for reply in reviews),
+        review_count=sum(_is_review(reply) for reply in replies),
+        raw_note_count=raw_note_count,
+        raw_fetched_at=fetched_at,
     )
 
 
@@ -115,17 +180,8 @@ def find_matching_forum(
     title and author names are used to identify the paper. The uploaded abstract
     is deliberately not used as matching evidence.
     """
-    try:
-        import openreview
-    except ImportError as exc:
-        raise RuntimeError(
-            'OpenReview client is missing. Install with: pip install -e ".[openreview]"'
-        ) from exc
-    settings = get_settings()
-    options = {"baseurl": "https://api2.openreview.net"}
-    if settings.openreview_username and settings.openreview_password:
-        options.update(username=settings.openreview_username, password=settings.openreview_password)
-    client = openreview.api.OpenReviewClient(**options)
+    client = _make_client()
+
     def normalize(value: str) -> str:
         value = unicodedata.normalize("NFKC", value).casefold()
         # Join PDF line-wrap hyphenation before punctuation is normalized away.
@@ -174,7 +230,6 @@ def find_matching_forum(
                     "title": candidate_title,
                     "authors": tuple(_content_values(candidate, "authors")),
                     "date": getattr(candidate, "tcdate", None) or getattr(candidate, "cdate", None),
-                    "note": candidate,
                 }
 
     def score(candidate_title: str) -> float:
@@ -256,7 +311,6 @@ def find_matching_forum(
             # Fetch authoritative author metadata and creation date before
             # choosing among high-title candidates; search results may omit them.
             note = client.get_note(forum_id)
-            candidate["note"] = note
             candidate["title"] = _content_text(note, "title") or candidate["title"]
             candidate["authors"] = tuple(_content_values(note, "authors")) or candidate["authors"]
             candidate["date"] = (getattr(note, "tcdate", None)
@@ -311,7 +365,6 @@ def find_matching_forum(
                            selected_forum_id=chosen_forum_id)
     if chosen_forum_id is None:
         return None
-    selected_note = candidates_by_id[chosen_forum_id]["note"]
-    return replace(fetch_paper(chosen_forum_id, client=client, submission=selected_note),
+    return replace(fetch_paper(chosen_forum_id, client=client),
                    match_score=chosen_title_score,
                    author_match_score=chosen_author_score, version_date=chosen_date)

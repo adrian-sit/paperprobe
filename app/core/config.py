@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     postgres_dsn: str | None = None
     mongodb_uri: str | None = None
     mongodb_database: str = "paperprobe"
+    mongodb_raw_collection: str = "openreview_raw_notes"
     openreview_username: str | None = None
     openreview_password: str | None = None
     openreview_forum_id: str | None = None

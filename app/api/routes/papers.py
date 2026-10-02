@@ -30,6 +30,7 @@ from app.services.openreview import (
     forum_source_uri,
     find_matching_forum,
 )
+from app.services.openreview_archive import RawArchiveError
 from app.services.pdf import extract_title_and_abstract
 
 router = APIRouter()
@@ -184,7 +185,9 @@ async def ingest_openreview_paper(
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
 
     stored = await persist_paper(db, source.title, source.abstract, extraction, "openreview",
-        source.source_uri, {"forum_id": source.forum_id, "public_review_count": source.review_count})
+        source.source_uri, {"forum_id": source.forum_id, "public_review_count": source.review_count,
+                            "raw_note_count": source.raw_note_count,
+                            "raw_fetched_at": source.raw_fetched_at.isoformat() if source.raw_fetched_at else None})
     response.status_code = status.HTTP_201_CREATED
     response.headers["X-PaperProbe-Cache"] = "miss"
     return stored
@@ -219,6 +222,8 @@ async def ingest_uploaded_paper(
                 find_matching_forum, uploaded.title,
                 authors=uploaded.authors,
             )
+        except RawArchiveError:
+            raise
         except Exception:
             # OpenReview lookup is opportunistic; the uploaded paper can still be analyzed.
             matched = None
@@ -234,7 +239,9 @@ async def ingest_uploaded_paper(
             metadata = {"forum_id": matched.forum_id, "public_review_count": matched.review_count,
                         "uploaded_pdf_sha256": digest, "title_match_score": matched.match_score,
                         "author_match_score": matched.author_match_score,
-                        "matched_version_date": matched.version_date}
+                        "matched_version_date": matched.version_date,
+                        "raw_note_count": matched.raw_note_count,
+                        "raw_fetched_at": matched.raw_fetched_at.isoformat() if matched.raw_fetched_at else None}
         else:
             title, abstract = uploaded.title, uploaded.abstract
             source_type, source_uri = "upload", upload_uri
@@ -264,15 +271,19 @@ async def ingest_openreview_with_progress(
             if existing:
                 await report("lookup", "Check stored papers", "success", "Loaded the cached paper.")
                 return serialize_paper(existing, from_cache=True)
-        await report("lookup", "Fetch from OpenReview", "running", "Fetching submission and public reviews.")
+        await report("lookup", "Fetch from OpenReview", "running",
+                     "Fetching the raw submission and forum notes, then archiving them to MongoDB.")
         source = await asyncio.to_thread(fetch_paper, request.forum_id)
-        await report("lookup", "Fetch from OpenReview", "success", f"Fetched “{source.title}”.")
+        await report("lookup", "Fetch from OpenReview", "success",
+                     f"Archived {source.raw_note_count} raw note(s) to MongoDB, then parsed “{source.title}”.")
         await report("extraction", "Extract paper fields", "running", "Gemini is extracting structured fields from the abstract.")
         extraction = await asyncio.to_thread(extract_abstract, source.title, source.abstract)
         await report("extraction", "Extract paper fields", "success", "Structured extraction completed.")
         await report("save", "Save paper", "running", "Writing the paper and extraction to PostgreSQL.")
         result = await persist_paper(db, source.title, source.abstract, extraction, "openreview",
-            source.source_uri, {"forum_id": source.forum_id, "public_review_count": source.review_count})
+            source.source_uri, {"forum_id": source.forum_id, "public_review_count": source.review_count,
+                                "raw_note_count": source.raw_note_count,
+                                "raw_fetched_at": source.raw_fetched_at.isoformat() if source.raw_fetched_at else None})
         await report("save", "Save paper", "success", "Paper and extracted fields saved.")
         return result
     return database_progress_response(operation)
@@ -326,6 +337,8 @@ async def upload_paper_with_progress(
                 find_matching_forum, uploaded.title, match_diagnostics,
                 authors=uploaded.authors,
             )
+        except RawArchiveError:
+            raise
         except Exception as exc:
             matched = None
             lookup_error = str(exc)
@@ -336,7 +349,8 @@ async def upload_paper_with_progress(
             selected_date = format_openreview_date(matched.version_date)
             date_note = f" Selected newest matching version ({selected_date})." if selected_date else ""
             await report("match", "Search OpenReview", "success",
-                         f"Matched forum {matched.forum_id}{confidence};{evidence_note}{date_note} Using its OpenReview submission.")
+                         f"Matched forum {matched.forum_id}{confidence};{evidence_note}{date_note} "
+                         f"Archived {matched.raw_note_count} raw note(s) to MongoDB before using its submission.")
             existing_id = await db.scalar(select(Paper.id).where(Paper.source_uri == matched.source_uri))
             if existing_id:
                 existing = await load_paper(db, existing_id)
@@ -347,7 +361,9 @@ async def upload_paper_with_progress(
             metadata = {"forum_id": matched.forum_id, "public_review_count": matched.review_count,
                         "uploaded_pdf_sha256": digest, "title_match_score": matched.match_score,
                         "author_match_score": matched.author_match_score,
-                        "matched_version_date": matched.version_date}
+                        "matched_version_date": matched.version_date,
+                        "raw_note_count": matched.raw_note_count,
+                        "raw_fetched_at": matched.raw_fetched_at.isoformat() if matched.raw_fetched_at else None}
         else:
             eligible_count = match_diagnostics.get("eligible_versions", 0)
             candidate_count = match_diagnostics.get("candidates", 0)

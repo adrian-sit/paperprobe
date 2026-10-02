@@ -106,22 +106,24 @@ paper retrieval, and question generation. Ingestion runs synchronously for now.
 
 ## Setup
 
-Requires Python 3.11 or later. Create a virtual environment, install the API
-and development dependencies, then create local configuration:
+Requires Python 3.11 or later. Create a virtual environment, install the API,
+development, OpenReview, and Gemini dependencies, then create local configuration:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -e ".[dev]"
+pip install -e ".[dev,openreview,gemini]"
 copy .env.example .env
 ```
 
-Add `GEMINI_API_KEY` to `.env` when you begin the Gemini extraction service.
-The file is git-ignored; `.env.example` documents every expected setting without
-containing any secrets. PostgreSQL, MongoDB, and OpenReview settings are reserved
-for their corresponding adapters and are not required to start the skeleton. When
-you add Gemini extraction, install its optional client with
-`pip install -e ".[dev,gemini]"`.
+The `.env` file is git-ignored; `.env.example` documents expected settings without
+containing secrets.
+Set `GEMINI_API_KEY` in `.env`. Set `POSTGRES_DSN` for PostgreSQL and
+`MONGODB_URI`, `MONGODB_DATABASE`, and `MONGODB_RAW_COLLECTION` for MongoDB.
+MongoDB is required for any OpenReview ingestion: the app stops that ingestion if
+the raw API notes cannot be archived, rather than continue with an incomplete
+source record. PDF-only processing can still use the uploaded document when no
+OpenReview match is found. Do not store credentials in committed files.
 
 ### Local PostgreSQL
 
@@ -143,6 +145,68 @@ the SQLAlchemy models with:
 .\.venv\Scripts\alembic revision --autogenerate -m "describe the change"
 .\.venv\Scripts\alembic upgrade head
 ```
+
+### Local MongoDB for raw OpenReview data
+
+MongoDB stores the raw JSON Note objects returned for the selected forum before
+the app maps the submission title and abstract or counts its reviews. Start both
+local databases from the repository root:
+
+```powershell
+docker compose up -d postgres mongodb
+docker compose ps
+```
+
+The default `.env.example` points the app at `mongodb://localhost:27017`, database
+`paperprobe`, collection `openreview_raw_notes`. Change `MONGODB_URI` if MongoDB
+runs elsewhere. Documents include the untouched note payload plus archive
+metadata (`forum_id`, `note_id`, note role, fetch time, payload hash, and archive
+schema version). Identical note payloads are idempotent; when a note changes, the
+new hash produces a separate document so older snapshots remain available.
+Indexes support reading snapshots by forum and note ID. To inspect the count:
+
+```powershell
+docker compose exec mongodb mongosh paperprobe --eval 'db.openreview_raw_notes.countDocuments()'
+```
+
+Mongo keeps the complete source Note JSON, including fields the current pipeline
+does not interpret. The archive can be read with
+`app.services.openreview_archive.load_archived_openreview_notes(forum_id)` for
+future extraction or migration jobs. Existing PostgreSQL cache hits do not fetch
+OpenReview again; use the database administration `reconcile` command to refresh
+a stored paper and create a raw archive snapshot for it.
+
+## Current data pipeline
+
+1. **Receive a source.** The user enters an OpenReview forum ID or uploads a PDF.
+   For a PDF, PaperProbe extracts its title, abstract, and likely author names.
+2. **Find the OpenReview paper.** The upload path searches candidate titles and
+   applies the title and author matching rules below. If no candidate qualifies,
+   the uploaded title and abstract remain the source. A direct forum ID skips
+   matching. Candidate title and author metadata is used in memory for this
+   decision; the selected forum's full notes are fetched and archived next.
+3. **Fetch and archive raw OpenReview data.** For a selected forum, PaperProbe
+   fetches the submission and paginated forum notes as API JSON. It writes each
+   raw Note object to MongoDB before mapping the selected submission into the
+   relational/Gemini pipeline.
+   Archive failure stops OpenReview ingestion. MongoDB is the source snapshot
+   layer; it preserves unknown fields so a later process can extract them
+   without relying on OpenReview to still return the same data.
+4. **Normalize and enrich.** After the archive succeeds, the app reads the
+   submission title and abstract, counts public review notes, and sends the
+   abstract to Gemini for structured fields such as claims, methods, datasets,
+   baselines, and limitations.
+5. **Save relational results.** PostgreSQL stores the canonical paper record,
+   abstract section, extracted fields, and generated questions in relational
+   tables. Paper metadata records the raw archive count and fetch time.
+6. **Generate questions.** The question endpoint loads the stored abstract and
+   extracted fields from PostgreSQL, asks Gemini to draft questions, and saves
+   them back to PostgreSQL. Future jobs can instead reload a Mongo raw snapshot
+   and derive additional fields while keeping the original JSON intact.
+
+The separation is intentional: MongoDB retains the source-shaped data for
+reprocessing; PostgreSQL holds the smaller, validated schema used by the current
+application and UI.
 
 ## Usage
 
