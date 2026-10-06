@@ -45,10 +45,12 @@ class PaperVersion(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     paper_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("papers.id", ondelete="CASCADE"))
+    source_forum_id: Mapped[str | None] = mapped_column(String(255), index=True)
     version_key: Mapped[str] = mapped_column(String(255))
     version_timestamp: Mapped[int | None] = mapped_column(BigInteger)
     is_latest: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     title: Mapped[str | None] = mapped_column(Text)
+    authors: Mapped[list[str] | None] = mapped_column(JSONB)
     abstract: Mapped[str | None] = mapped_column(Text)
     paper_text: Mapped[str | None] = mapped_column(Text)
     raw_metadata: Mapped[dict | None] = mapped_column(JSONB)

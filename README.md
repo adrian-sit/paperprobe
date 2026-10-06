@@ -148,12 +148,13 @@ their forum IDs again or upload them again to parse sections and populate field 
 ### Local MongoDB raw archive
 
 MongoDB retains the original OpenReview API documents before they are normalized.
-Each document has `forum_id`, `version_id`, `version_timestamp`, `note_id`,
+Each retained document has `forum_id`, `version_id`, `version_timestamp`, `note_id`,
 `record_type` (`submission_edit`, `submission_note`, or `review`), fetch time,
 and a payload hash. The archive key includes forum, version, record type, note,
 and content hash, so edits do not overwrite each other and changed note payloads
-remain recoverable. Review documents also carry the version assignment used by
-the relational layer.
+remain recoverable for the retained current version. Review documents also carry
+the version assignment used by the relational layer. Refreshing a forum removes
+raw documents tagged to its superseded submission versions.
 
 ```powershell
 docker compose exec mongodb mongosh paperprobe --eval 'db.openreview_raw_notes.countDocuments()'
@@ -174,35 +175,41 @@ snapshot; PostgreSQL is the queryable application model.
    match of at least 90% requires at least 30% author similarity. If no forum is
    safely matched, the upload is still stored as a local paper with one version
    keyed by its PDF digest and no OpenReview edit timestamp.
-2. **Fetch the forum history.** For a matched forum, PaperProbe requests the
-   submission and its edit history, plus the paginated forum notes. Each distinct
-   submission edit is treated as a revision identified by its OpenReview edit ID
-   and timestamp. The current submission note is used as the authoritative
-   content of the latest revision. Version-specific PDF attachments are
-   downloaded and parsed; if an older edit has no attachment reference, its text
-   stays empty rather than incorrectly copying the current revision's PDF. For a
-   referenced PDF, the downloader tries the field-ID route, OpenReview's
-   note-attachment route, and the note-ID PDF route. If all fail or the PDF has
+2. **Find related forums and fetch their newest versions.** OpenReview forum IDs are
+     not assumed to contain every revision of a paper. PaperProbe searches the
+     title index with overlapping title phrases, scores candidate titles and
+     authors using the existing rules (exact normalized title, or title similarity
+     of at least 90% plus author similarity of at least 30%), and fetches every
+     qualifying forum. Each forum's current submission note, newest edit, and
+     paginated forum notes are loaded. Only each forum's newest submission edit is retained
+     as a revision, identified by its source forum ID, OpenReview edit ID, and
+     timestamp. The current submission note is the authoritative content for that
+     forum version. Its PDF is downloaded and parsed. For a referenced PDF, the
+     downloader tries the PDF field ID and reference routes, OpenReview's
+     note-attachment route, and the note-ID PDF route via `openreview-py`
+     (`get_pdf(id=pdf_id,
+   is_reference=True)`) for revision-specific references. If all fail or the PDF has
    no extractable text, forum-ID ingestion continues with that version's
    available title, abstract, and reviews. Its `paper_text` stays empty and the
    failure is recorded in version metadata. An uploaded PDF is an independent
    text source: its extracted full text is always retained and used for the
-   matched forum's latest version, even if OpenReview lookup or PDF retrieval
+   newest matched forum version, even if OpenReview lookup or PDF retrieval
    fails. A lookup failure falls back to storing the upload as a local paper.
    Revision text is not collapsed into one forum-level field.
-3. **Archive raw data first.** The API's raw edit/note JSON is written to MongoDB
-   with both forum and revision identifiers. Review notes are also archived and
-   tagged to a revision. OpenReview does not explicitly identify the manuscript
-   revision a review critiques, so PaperProbe assigns each review to the latest
-   submission edit timestamp at or before the review's creation timestamp; if
-   timestamps are unavailable or precede all edits, it assigns the earliest
-   known revision. This is a documented timestamp-based association.
-4. **Normalize into PostgreSQL.** `papers` has one row for a forum (or a local
-   upload without a forum ID). `paper_versions` stores one row per revision,
-   with version key, timestamp, `is_latest`, title, abstract, and complete
-   `paper_text`. A unique forum ID prevents duplicate forum roots. Re-ingesting
-   a forum refreshes its existing versions and reviews so newly posted revisions
-   and reviews are discovered; it does not short-circuit on a cached paper.
+3. **Archive raw data first.** The latest submission edit and all review-note
+   JSON for each matched forum are written to MongoDB with forum and version
+   identifiers. Since only the latest version per forum is retained, all reviews
+   from that forum are associated with that version. When a forum is refreshed,
+   obsolete raw snapshots for its older submission versions are removed.
+4. **Normalize into PostgreSQL.** `papers` has one row per paper identity (or a
+   local upload without an OpenReview match), even when that identity spans
+   multiple forum IDs. `paper_versions` stores one row per revision, with version
+   key, timestamp, `is_latest`, title, authors, abstract, and complete `paper_text`.
+   `source_forum_id` records which OpenReview forum supplied each revision, and
+   the version key combines forum ID and edit ID so IDs from separate forums
+   cannot collide. The paper root records all matched forum IDs in metadata.
+   Re-ingesting any matched forum refreshes each qualifying forum's latest version
+   and reviews, and removes older relational versions for those forums.
 5. **Parse and store named sections.** Each version's readable full text is
    first cleaned of repeated three/four-digit line-number gutters when those
    labels form a clear sequence. Then it is split at recognized standalone
@@ -224,7 +231,8 @@ snapshot; PostgreSQL is the queryable application model.
    version; API responses resolve the section ID to its heading. Multiple rows
    of the same field type can preserve results from different source sections.
    `reviews` stores review text read back from MongoDB, along with raw content and OpenReview note
-   metadata; review rows reference the assigned version. Questions also retain
+   metadata; every review row references the assigned version. Revision authors,
+   sections, text, chunks, and review notes are version-scoped as well. Questions also retain
    their version link.
 7. **Prepare full text for retrieval.** Every version's `paper_text` is split
    into overlapping chunks in `paper_chunks` (about 3,000 characters per chunk
@@ -244,8 +252,9 @@ snapshot; PostgreSQL is the queryable application model.
 Uploaded PDFs and PDFs fetched from OpenReview both populate
 `paper_versions.paper_text`. PDF extraction reads embedded text; scanned pages
 that need OCR are not currently recognized. MongoDB preserves source-shaped
-OpenReview JSON for future extraction, while PostgreSQL stores version-linked
-text, review records, structured fields, and retrieval chunks.
+OpenReview JSON for future extraction, while PostgreSQL stores one latest version
+per matched forum with its version-linked text, review records, structured fields,
+and retrieval chunks.
 
 ## Usage
 
@@ -262,20 +271,24 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/v1/papers/openrevi
   -Body '{"forum_id":"<public-openreview-forum-id>"}'
 ```
 
-The response contains the persisted forum-level paper ID. Retrieve the latest
+The response contains the persisted paper ID. Retrieve the latest
 revision with `GET /api/v1/papers/{paper_id}` or a particular revision, including
 its full text, extracted fields, and reviews, with
 `GET /api/v1/papers/{paper_id}/versions/{version_id}`.
 
-Submitting the same forum ID again refreshes the OpenReview edit and review
-history, upserts the versions, and re-runs extraction on the latest abstract so
-newer API data is discovered. The endpoint returns the existing paper identity
-when one is already stored.
+Submitting a forum ID fetches its newest version, searches for other forums using
+the same title/author rules, and combines the newest version and reviews from each
+qualifying forum. Re-ingestion refreshes those versions and re-runs extraction on
+the newest one overall.
 
 Open `http://127.0.0.1:8000/` for the browser interface. Enter a forum ID or upload
 a text-based PDF (up to 20 MB). Uploads are searched against OpenReview using the
-extracted title and likely author names. A match stores all fetched revisions
-under one forum record; otherwise, the PDF is stored as a one-version local paper.
+extracted title and likely author names. A match stores the newest version from
+each qualifying forum under one paper record; otherwise, the PDF is stored as a
+one-version local paper.
+After ingestion, use the revision selector to inspect each revision's source forum,
+title, authors, parsed sections, extracted fields, and reviews. Review text is expandable
+and the selected version key, timestamp, and review count stay visible in the UI.
 
 1. PaperProbe extracts the PDF title, abstract, and likely author names from the
    first-page author block, then checks PostgreSQL for the exact PDF (by SHA-256
@@ -283,7 +296,9 @@ under one forum record; otherwise, the PDF is stored as a one-version local pape
    OpenReview matches.
 2. It searches OpenReview's title index using the full title and up to eight short,
    overlapping phrases sampled across the title. Results from these searches are
-   combined by forum ID.
+   combined by forum ID. Every forum that passes the matching rules contributes
+   only its latest submission version and its reviews, stored together under one
+   paper record with each version retaining its source forum ID.
 3. Titles are normalized for case, Unicode accents, punctuation, whitespace, and
    line-wrap hyphenation, then scored using character-sequence similarity and
    title-word overlap. A title score of at least 90% is required; an exact
@@ -292,12 +307,10 @@ under one forum record; otherwise, the PDF is stored as a one-version local pape
    threshold allows a partial author extraction to contribute evidence; an exact
    title can still match when author extraction is incomplete or unavailable. The
    uploaded abstract is not used to rank or approve candidates.
-4. Among qualifying candidates, PaperProbe prefers exact-title candidates with
-   author evidence when available, then selects the newest forum creation date
-   (`tcdate`, falling back to `cdate`). It fetches that forum's edit history and
-   all its revisions; section-scoped Gemini extraction uses the latest revision's
-   parsed full text. If no candidate
-   qualifies, it uses the uploaded PDF's title and abstract.
+4. Each qualifying forum contributes only its newest edit. These per-forum
+   versions are ordered by timestamp, and the newest overall becomes the current
+   version for section-scoped Gemini extraction. If no candidate qualifies, it
+   uses the uploaded PDF's title and abstract.
 
 Both matched and PDF-only papers continue through the same Gemini extraction and
 question-generation flow. The UI renders extracted fields as cards and lets you

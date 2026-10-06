@@ -27,10 +27,12 @@ class StoredExtractedField(BaseModel):
 
 class PaperVersionSummary(BaseModel):
     id: UUID
+    source_forum_id: str | None = None
     version_key: str
     version_timestamp: int | None
     is_latest: bool
     title: str | None
+    authors: list[str] = Field(default_factory=list)
     text_characters: int
     review_count: int
     pdf_error: str | None = None
@@ -38,6 +40,7 @@ class PaperVersionSummary(BaseModel):
 
 class StoredReview(BaseModel):
     id: UUID
+    paper_version_id: UUID
     openreview_note_id: str
     review_text: str
     invitation: str | None
@@ -47,10 +50,12 @@ class StoredReview(BaseModel):
 class PaperVersionDetail(BaseModel):
     id: UUID
     paper_id: UUID
+    source_forum_id: str | None = None
     version_key: str
     version_timestamp: int | None
     is_latest: bool
     title: str | None
+    authors: list[str] = Field(default_factory=list)
     abstract: str | None
     paper_text: str | None
     pdf_error: str | None = None
@@ -64,6 +69,7 @@ class PaperDetail(BaseModel):
     source_type: str
     source_uri: str
     title: str | None
+    authors: list[str] = Field(default_factory=list)
     forum_id: str | None = None
     latest_version_id: UUID | None = None
     versions: list[PaperVersionSummary] = Field(default_factory=list)

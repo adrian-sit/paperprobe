@@ -1,4 +1,4 @@
-const state = { paperId: null };
+const state = { paperId: null, paper: null, selectedVersionId: null };
 const statusLine = document.querySelector('#status');
 const fetchButton = document.querySelector('#fetch-button');
 const questionButton = document.querySelector('#question-button');
@@ -128,18 +128,99 @@ function renderSections(sections) {
   document.querySelector('#sections-details').open = false;
 }
 
+function formatVersionDate(timestamp) {
+  if (!timestamp) return '';
+  const milliseconds = timestamp < 100000000000 ? timestamp * 1000 : timestamp;
+  const date = new Date(milliseconds);
+  return Number.isNaN(date.getTime()) ? '' : date.toLocaleString();
+}
+
+function renderReviews(reviews, version) {
+  const container = document.querySelector('#paper-reviews');
+  container.replaceChildren();
+  const count = reviews?.length || 0;
+  document.querySelector('#review-count').textContent = `${count} ${count === 1 ? 'review' : 'reviews'} · ${version.version_key}`;
+  document.querySelector('#reviews-empty').hidden = count > 0;
+  (reviews || []).forEach((review, index) => {
+    const details = document.createElement('details');
+    details.className = 'paper-review';
+    const summary = document.createElement('summary');
+    const date = review.written_at ? new Date(review.written_at).toLocaleDateString() : '';
+    summary.textContent = `${review.invitation || `Review ${index + 1}`}${date ? ` · ${date}` : ''}`;
+    const text = document.createElement('pre');
+    text.textContent = review.review_text || '(No review text)';
+    details.append(summary, text);
+    container.append(details);
+  });
+}
+
+function renderRevision(data, version) {
+  state.selectedVersionId = version.id;
+  document.querySelector('#revision-select').value = version.id;
+  if (version.source_forum_id) {
+    document.querySelector('#source-link').href = `https://openreview.net/forum?id=${encodeURIComponent(version.source_forum_id)}`;
+  }
+  document.querySelector('#paper-title').textContent = data.title || version.title || 'Untitled paper';
+  document.querySelector('#paper-authors').textContent = (data.authors || version.authors || []).join(', ') || 'Authors unavailable';
+  const date = formatVersionDate(version.version_timestamp);
+  const latest = version.is_latest ? ' · newest overall' : ' · latest in source forum';
+  document.querySelector('#revision-context').textContent = `${version.version_key}${version.source_forum_id ? ` · source forum ${version.source_forum_id}` : ''}${date ? ` · ${date}` : ''}${latest} · ${version.text_characters.toLocaleString()} text characters`;
+  const abstractSection = (data.sections || []).find(section => (section.heading || '').toLowerCase() === 'abstract');
+  document.querySelector('#abstract').textContent = data.abstract || abstractSection?.content || 'No abstract stored.';
+  renderSections(data.sections || []);
+  renderExtraction(data.extracted_fields || []);
+  document.querySelector('#extraction-context').textContent = version.is_latest
+    ? 'Structured extraction is associated with the latest revision.'
+    : 'This older revision is stored with its own text, sections, and reviews. Structured Gemini extraction currently runs on the latest revision only.';
+  renderReviews(data.reviews || [], version);
+  document.querySelector('#questions').replaceChildren();
+}
+
 function renderPaper(paper) {
   state.paperId = paper.id;
+  state.paper = paper;
   document.querySelector('#paper-view').hidden = false;
-  document.querySelector('#paper-title').textContent = paper.title || 'Untitled paper';
   const sourceLink = document.querySelector('#source-link');
-  sourceLink.href = paper.source_uri;
+  sourceLink.href = paper.forum_id ? `https://openreview.net/forum?id=${encodeURIComponent(paper.forum_id)}` : paper.source_uri;
   sourceLink.hidden = paper.source_type === 'upload';
-  document.querySelector('#abstract').textContent = paper.sections.find(section => section.heading === 'Abstract')?.content || 'No abstract stored.';
-  renderSections(paper.sections || []);
-  document.querySelector('#questions').replaceChildren();
-  renderExtraction(paper.extracted_fields);
+  const versions = [...(paper.versions || [])].sort((a, b) => (b.version_timestamp || 0) - (a.version_timestamp || 0));
+  const select = document.querySelector('#revision-select');
+  select.replaceChildren();
+  versions.forEach(version => {
+    const option = document.createElement('option');
+    option.value = version.id;
+    option.textContent = `${version.is_latest ? 'Newest overall · ' : 'Latest in forum · '}${version.version_key}${version.source_forum_id ? ` · forum ${version.source_forum_id}` : ''}${formatVersionDate(version.version_timestamp) ? ` · ${formatVersionDate(version.version_timestamp)}` : ''} · ${version.review_count} reviews`;
+    select.append(option);
+  });
+  const latest = versions.find(version => version.id === paper.latest_version_id) || versions[0];
+  if (latest) renderRevision(paper, latest);
+  else {
+    document.querySelector('#paper-title').textContent = paper.title || 'Untitled paper';
+    document.querySelector('#paper-authors').textContent = (paper.authors || []).join(', ');
+    document.querySelector('#abstract').textContent = 'No abstract stored.';
+    renderSections([]); renderExtraction([]); renderReviews([], { version_key: 'No revision' });
+  }
 }
+
+document.querySelector('#revision-select').addEventListener('change', async event => {
+  if (!state.paperId || !event.target.value) return;
+  const version = state.paper.versions.find(item => item.id === event.target.value);
+  if (!version) return;
+  if (version.id === state.paper.latest_version_id) {
+    renderRevision(state.paper, version);
+    return;
+  }
+  event.target.disabled = true;
+  try {
+    const detail = await request(`/api/v1/papers/${state.paperId}/versions/${version.id}`);
+    renderRevision(detail, version);
+  } catch (error) {
+    setStatus(`Could not load revision ${version.version_key}: ${error.message}`, true);
+    event.target.value = state.selectedVersionId || state.paper.latest_version_id;
+  } finally {
+    event.target.disabled = false;
+  }
+});
 
 document.querySelector('#ingest-form').addEventListener('submit', async event => {
   event.preventDefault();

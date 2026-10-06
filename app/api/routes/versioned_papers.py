@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -100,12 +100,15 @@ def _serialize(paper: Paper, *, from_cache: bool = False, refreshed: bool = Fals
     return PaperDetail(
         id=paper.id, source_type=paper.source_type, source_uri=paper.source_uri,
         title=latest.title if latest else paper.title, forum_id=paper.forum_id,
+        authors=list(latest.authors or []) if latest else [],
         latest_version_id=latest.id if latest else None,
         full_text=latest.paper_text if latest else None, status=paper.status,
         raw_metadata=paper.raw_metadata, created_at=paper.created_at,
         versions=[PaperVersionSummary(
-            id=v.id, version_key=v.version_key, version_timestamp=v.version_timestamp,
-            is_latest=v.is_latest, title=v.title, text_characters=len(v.paper_text or ""),
+            id=v.id, source_forum_id=v.source_forum_id,
+            version_key=v.version_key, version_timestamp=v.version_timestamp,
+            is_latest=v.is_latest, title=v.title, authors=list(v.authors or []),
+            text_characters=len(v.paper_text or ""),
             review_count=len(v.reviews), pdf_error=(v.raw_metadata or {}).get("pdf_error"),
         ) for v in sorted(paper.versions, key=lambda v: v.version_timestamp or 0)],
         sections=[StoredSection(id=s.id, position=s.position, heading=s.heading, content=s.content)
@@ -116,7 +119,8 @@ def _serialize(paper: Paper, *, from_cache: bool = False, refreshed: bool = Fals
             section_id=f.section_id, section_heading=section_headings.get(f.section_id),
         ) for f in latest.extracted_fields] if latest else [],
         reviews=[StoredReview(
-            id=r.id, openreview_note_id=r.openreview_note_id, review_text=r.review_text,
+            id=r.id, paper_version_id=r.paper_version_id, openreview_note_id=r.openreview_note_id,
+            review_text=r.review_text,
             invitation=r.invitation, written_at=r.written_at,
         ) for r in sorted(latest.reviews, key=lambda r: r.written_at or datetime.min.replace(tzinfo=timezone.utc))] if latest else [],
         from_cache=from_cache,
@@ -130,24 +134,42 @@ async def _store(
     metadata: dict, upload_digest: str | None = None,
 ) -> PaperDetail:
     forum_id = source.forum_id if source else None
-    paper = await db.scalar(select(Paper).where(
-        (Paper.forum_id == forum_id) if forum_id else (Paper.source_uri == source_uri)
-    ))
+    source_forum_ids = sorted({
+        value for value in ([forum_id] + [getattr(item, "forum_id", None)
+                                         for item in (source.versions if source else ())])
+        if value
+    })
+    if source_forum_ids:
+        existing_by_forum = select(PaperVersion.paper_id).where(
+            PaperVersion.source_forum_id.in_(source_forum_ids)
+        )
+        paper = await db.scalar(select(Paper).where(or_(
+            Paper.forum_id.in_(source_forum_ids), Paper.id.in_(existing_by_forum)
+        )).order_by(Paper.created_at).limit(1))
+    else:
+        paper = await db.scalar(select(Paper).where(Paper.source_uri == source_uri))
     was_existing = paper is not None
     if paper is None:
         paper = Paper(forum_id=forum_id, source_type=source_type, source_uri=source_uri)
         db.add(paper)
         await db.flush()
-    elif source and paper.source_uri != source_uri:
+    elif source and paper.forum_id is None:
+        paper.forum_id = forum_id
         paper.source_uri = source_uri
 
-    paper.forum_id = forum_id
+    if paper.forum_id is None:
+        paper.forum_id = forum_id
     paper.source_type = source_type
-    paper.source_uri = source_uri
+    if not paper.source_uri:
+        paper.source_uri = source_uri
     paper.title = title
     paper.status = "completed"
+    previous_forums = (paper.raw_metadata or {}).get("related_forum_ids", [])
+    if isinstance(previous_forums, str):
+        previous_forums = [previous_forums]
     paper.raw_metadata = {
         **(paper.raw_metadata or {}), **metadata,
+        "related_forum_ids": sorted(set(previous_forums or []) | set(source_forum_ids)),
         "full_text_source": (
             next((version.full_text_source for version in source.versions if version.is_latest),
                  "openreview_pdf") if source else "uploaded_pdf"
@@ -162,27 +184,37 @@ async def _store(
         version_key = f"upload:{upload_digest}" if upload_digest else "local:current"
         versions = [SimpleNamespace(
             version_id=version_key, version_timestamp=None,
-            title=title, abstract=abstract, full_text=full_text, is_latest=True, reviews=(),
+            title=title, authors=(), abstract=abstract, full_text=full_text, is_latest=True,
+            forum_id=None, reviews=(),
             pdf_error=None, full_text_source="uploaded_pdf",
         )]
 
     await db.execute(update(PaperVersion).where(PaperVersion.paper_id == paper.id)
                      .values(is_latest=False))
     await db.flush()
+    retained_version_ids = []
     for item in versions:
+        source_forum_id = getattr(item, "forum_id", None) or forum_id
+        version_key = f"{source_forum_id}:{item.version_id}" if source_forum_id else item.version_id
         version = await db.scalar(select(PaperVersion).where(
-            PaperVersion.paper_id == paper.id, PaperVersion.version_key == item.version_id
+            PaperVersion.paper_id == paper.id,
+            PaperVersion.version_key.in_([version_key, item.version_id]),
         ))
         if version is None:
-            version = PaperVersion(paper_id=paper.id, version_key=item.version_id)
+            version = PaperVersion(paper_id=paper.id, version_key=version_key)
             db.add(version)
             await db.flush()
+        else:
+            version.version_key = version_key
+        retained_version_ids.append(version.id)
+        version.source_forum_id = source_forum_id
         version.version_timestamp = item.version_timestamp
         version.is_latest = item.is_latest
         version.title = item.title
+        version.authors = list(getattr(item, "authors", ()) or ())
         version.abstract = item.abstract
         version.paper_text = item.full_text or None
-        version.raw_metadata = {"forum_id": forum_id, "version_id": item.version_id,
+        version.raw_metadata = {"forum_id": source_forum_id, "version_id": item.version_id,
                                 "full_text_characters": len(item.full_text or ""),
                                 "pdf_error": item.pdf_error,
                                 "full_text_source": item.full_text_source}
@@ -224,6 +256,12 @@ async def _store(
                     value=_normalized_field(extracted.field_type, extracted.value),
                     extraction_model=get_settings().gemini_model, prompt_version="section-v1",
                 ))
+    if source_forum_ids and retained_version_ids:
+        await db.execute(delete(PaperVersion).where(
+            PaperVersion.paper_id == paper.id,
+            PaperVersion.source_forum_id.in_(source_forum_ids),
+            PaperVersion.id.not_in(retained_version_ids),
+        ))
     await db.flush()
     await db.execute(update(Question).where(Question.paper_id == paper.id).values(status="stale"))
     await db.commit()
@@ -242,18 +280,31 @@ def database_progress_response(operation):
 
 async def _ingest_forum(db: AsyncSession, forum_id: str, report=None) -> PaperDetail:
     if report:
-        stored_id = await db.scalar(select(Paper.id).where(Paper.forum_id == forum_id))
+        stored_id = await db.scalar(select(Paper.id).outerjoin(PaperVersion).where(or_(
+            Paper.forum_id == forum_id, PaperVersion.source_forum_id == forum_id
+        )).limit(1))
         message = (f"Found stored forum record {stored_id}; refreshing revisions and reviews."
                    if stored_id else "No stored forum record; fetching it for the first time.")
         await report("lookup", "Check stored papers", "success", message)
         await report("lookup", "Fetch from OpenReview", "running",
                      "Fetching all submission edits and forum notes; raw notes are archived in MongoDB.")
-    source = await asyncio.to_thread(fetch_paper, forum_id)
+    seed = await asyncio.to_thread(fetch_paper, forum_id)
+    latest_seed = max(seed.versions,
+                      key=lambda item: (item.version_timestamp or 0, item.version_id),
+                      default=None)
+    source = await asyncio.to_thread(
+        find_matching_forum, seed.title, {},
+        authors=latest_seed.authors if latest_seed else (),
+        include_forum_id=forum_id, seed_paper=seed,
+    )
+    source = source or seed
     if report:
         missing_pdf_count = sum(bool(version.pdf_error) for version in source.versions)
         fetch_state = "warning" if missing_pdf_count else "success"
-        fetch_detail = (f"Archived versioned notes; loaded {len(source.versions)} revisions and "
-                       f"{sum(len(v.reviews) for v in source.versions)} reviews.")
+        source_forum_ids = sorted({version.forum_id for version in source.versions if version.forum_id})
+        fetch_detail = (f"Archived {len(source_forum_ids)} matching forum(s) "
+                       f"({', '.join(source_forum_ids)}); loaded {len(source.versions)} "
+                       f"revisions and {sum(len(v.reviews) for v in source.versions)} reviews.")
         if missing_pdf_count:
             fetch_detail += (f" PDF text was unavailable for {missing_pdf_count} revision(s); "
                              "continuing with OpenReview title, abstract, and reviews.")
@@ -356,6 +407,7 @@ async def _ingest_upload(db: AsyncSession, file: UploadFile, data: bytes, report
             missing_pdf_count = sum(bool(version.pdf_error and not version.full_text)
                                     for version in matched.versions)
             detail = (f"Matched forum {matched.forum_id} ({matched.match_score or 0:.0%} title similarity); "
+                      f"combined {len({v.forum_id for v in matched.versions if v.forum_id})} matching forum(s), "
                       f"loaded {len(matched.versions)} revisions and "
                       f"{sum(len(v.reviews) for v in matched.versions)} reviews.")
             if matched.versions and next(v for v in matched.versions if v.is_latest).full_text_source == "uploaded_pdf":
@@ -496,9 +548,11 @@ async def get_paper_version(paper_id: UUID, version_id: UUID,
     if not version:
         raise HTTPException(404, detail="Paper version not found.")
     return PaperVersionDetail(
-        id=version.id, paper_id=version.paper_id, version_key=version.version_key,
+        id=version.id, paper_id=version.paper_id, source_forum_id=version.source_forum_id,
+        version_key=version.version_key,
         version_timestamp=version.version_timestamp, is_latest=version.is_latest,
-        title=version.title, abstract=version.abstract, paper_text=version.paper_text,
+        title=version.title, authors=list(version.authors or []),
+        abstract=version.abstract, paper_text=version.paper_text,
         pdf_error=(version.raw_metadata or {}).get("pdf_error"),
         sections=[StoredSection(id=s.id, position=s.position, heading=s.heading, content=s.content)
                   for s in sorted(version.sections, key=lambda s: s.position)],
@@ -509,7 +563,8 @@ async def get_paper_version(paper_id: UUID, version_id: UUID,
             section_heading=next((s.heading for s in version.sections if s.id == f.section_id), None),
         ) for f in version.extracted_fields],
         reviews=[StoredReview(
-            id=r.id, openreview_note_id=r.openreview_note_id, review_text=r.review_text,
+            id=r.id, paper_version_id=r.paper_version_id, openreview_note_id=r.openreview_note_id,
+            review_text=r.review_text,
             invitation=r.invitation, written_at=r.written_at,
         ) for r in version.reviews],
     )

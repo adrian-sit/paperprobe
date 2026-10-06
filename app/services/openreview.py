@@ -1,6 +1,5 @@
 import re
 import unicodedata
-from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
@@ -45,8 +44,10 @@ class OpenReviewVersion:
     version_timestamp: int | None
     title: str
     abstract: str
+    authors: tuple[str, ...]
     full_text: str
     is_latest: bool
+    forum_id: str | None = None
     reviews: tuple[OpenReviewReview, ...] = ()
     pdf_error: str | None = None
     full_text_source: str = "openreview_pdf"
@@ -132,81 +133,21 @@ def _as_datetime(timestamp: int | None) -> datetime | None:
         return None
 
 
-def _note_edits(client: Any, note_id: str) -> list[dict[str, Any]]:
-    """Fetch the full edit history for a submission note."""
+def _latest_note_edit(client: Any, note_id: str) -> dict[str, Any] | None:
+    """Fetch only the newest edit record for a submission note."""
     edits_url = f"{client.notes_url.rsplit('/', 1)[0]}/notes/edits"
-    edits: list[dict[str, Any]] = []
-    offset = 0
-    page_size = 100
-    while True:
-        response = client.session.get(
-            edits_url,
-            params={"note.id": note_id, "limit": page_size, "offset": offset, "sort": "tcdate:asc"},
-            headers=client.headers,
-            timeout=30,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if not isinstance(payload, dict) or not isinstance(payload.get("edits", []), list):
-            raise RuntimeError("OpenReview returned an invalid note edit response.")
-        page = [edit for edit in payload.get("edits", []) if isinstance(edit, dict)]
-        if not page:
-            break
-        edits.extend(page)
-        offset += len(page)
-        total = payload.get("count")
-        if isinstance(total, int) and offset >= total:
-            break
-        if len(page) < page_size and not isinstance(total, int):
-            break
-    return sorted(edits, key=lambda edit: (_timestamp(edit) or 0, str(edit.get("id", ""))))
-
-
-def _apply_content_patch(current: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
-    merged = deepcopy(current)
-    for key, value in patch.items():
-        if isinstance(value, dict) and value.get("delete") is True:
-            merged.pop(key, None)
-        else:
-            merged[key] = deepcopy(value)
-    return merged
-
-
-def _version_snapshots(
-    submission: dict[str, Any], edits: list[dict[str, Any]]
-) -> list[tuple[str, int | None, dict[str, Any], dict[str, Any] | None]]:
-    """Reconstruct note content after each edit, retaining the exact raw Edit."""
-    base = deepcopy(submission)
-    # Rebuild from the creation Edit forward. The fetched Note is the current
-    # state and must not be used as the baseline for older revision snapshots.
-    content: dict[str, Any] = {}
-    snapshots = []
-    for index, edit in enumerate(edits):
-        changed_note = edit.get("note") if isinstance(edit.get("note"), dict) else {}
-        content_patch = changed_note.get("content")
-        if not isinstance(content_patch, dict):
-            content_patch = edit.get("content", {})
-        if isinstance(content_patch, dict):
-            content = (deepcopy(content_patch) if edit.get("replacement") is True
-                       else _apply_content_patch(content, content_patch))
-        state = deepcopy(base)
-        state.update({key: deepcopy(value) for key, value in changed_note.items() if key != "content"})
-        state["content"] = deepcopy(content)
-        stamp = _timestamp(edit) or _timestamp(changed_note)
-        key = str(edit.get("id") or f"{stamp or 0}-{index}")
-        snapshots.append((key, stamp, state, edit))
-
-    if not snapshots:
-        stamp = _timestamp(submission)
-        key = str(stamp or submission.get("id") or "current")
-        snapshots.append((key, stamp, base, None))
-    else:
-        # The note entity is the authoritative currently effective state. Keep
-        # the edit's stable ID/timestamp but make its content exact.
-        key, stamp, _, edit = snapshots[-1]
-        latest = deepcopy(submission)
-        snapshots[-1] = (key, stamp or _timestamp(submission), latest, edit)
-    return snapshots
+    response = client.session.get(
+        edits_url,
+        params={"note.id": note_id, "limit": 1, "offset": 0, "sort": "tcdate:desc"},
+        headers=client.headers,
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or not isinstance(payload.get("edits", []), list):
+        raise RuntimeError("OpenReview returned an invalid note edit response.")
+    edits = [edit for edit in payload.get("edits", []) if isinstance(edit, dict)]
+    return max(edits, key=lambda edit: (_timestamp(edit) or 0, str(edit.get("id", "")))) if edits else None
 
 
 def _content_value(note: dict[str, Any], field: str) -> Any:
@@ -316,6 +257,13 @@ def _openreview_pdf_text(
         attempts.append((f"PDF field id ({pdf_url})", lambda: client.session.get(
             pdf_url, headers=client.headers, timeout=60
         )))
+        get_pdf = getattr(client, "get_pdf", None)
+        if callable(get_pdf):
+            # Some venues expose the PDF field as an OpenReview revision
+            # reference. openreview-py's reference mode resolves that through
+            # its revision-aware endpoint rather than /pdf/{field-id}.
+            attempts.append(("PDF field reference (get_pdf, is_reference=True)",
+                             lambda: get_pdf(id=pdf_id, is_reference=True)))
 
     if allow_note_fallback:
         get_attachment = getattr(client, "get_attachment", None)
@@ -364,49 +312,52 @@ def _openreview_pdf_text(
 
 
 def fetch_paper(forum_id: str, *, client=None) -> OpenReviewPaper:
-    """Archive every submission edit and version-assigned review before normalization."""
+    """Fetch the newest submission version and its reviews for one forum."""
     if client is None:
         client = _make_client()
     submission, replies = _raw_api_notes(client, forum_id)
-    edits = _note_edits(client, str(submission.get("id") or forum_id))
-    snapshots = _version_snapshots(submission, edits)
-    latest_version_id = max(
-        snapshots, key=lambda item: (item[1] or 0, item[0])
-    )[0]
-
-    timestamped_versions = sorted(
-        ((timestamp, version_id) for version_id, timestamp, _, _ in snapshots),
-        key=lambda item: (item[0] or 0, item[1]),
-    )
+    try:
+        latest_edit = _latest_note_edit(client, str(submission.get("id") or forum_id))
+    except Exception:
+        # The fetched Note is itself the current effective state. Use it if the
+        # optional edit lookup is unavailable rather than blocking ingestion.
+        latest_edit = None
+    latest_timestamp = _timestamp(latest_edit or {}) or _timestamp(submission)
+    latest_version_id = str((latest_edit or {}).get("id") or latest_timestamp
+                            or submission.get("id") or "current")
+    latest_snapshot = (latest_version_id, latest_timestamp, submission, latest_edit)
+    snapshots = [latest_snapshot]
     review_documents: list[dict[str, Any]] = []
     for reply in replies:
         if not _is_review(reply):
             continue
         review_timestamp = _timestamp(reply)
-        previous = [item for item in timestamped_versions if item[0] is not None
-                    and review_timestamp is not None and item[0] <= review_timestamp]
-        target_version_id = previous[-1][1] if previous else timestamped_versions[0][1]
         review_documents.append({
             "record_type": "review",
-            "version_id": target_version_id,
-            "version_timestamp": next(
-                (stamp for key, stamp, _, _ in snapshots if key == target_version_id), None
-            ),
+            "version_id": latest_version_id,
+            "version_timestamp": latest_snapshot[1],
             "raw_note": reply,
             "archive_metadata": {"review_timestamp": review_timestamp},
         })
 
     fetched_at = datetime.now(timezone.utc)
-    version_documents = []
-    for version_id, timestamp, state, edit in snapshots:
+    version_documents = [{
+        "record_type": "submission_note",
+        "version_id": latest_version_id,
+        "version_timestamp": latest_timestamp,
+        "raw_note": submission,
+    }]
+    if latest_edit:
         version_documents.append({
-            "record_type": "submission_edit" if edit else "submission_note",
-            "version_id": version_id,
-            "version_timestamp": timestamp,
-            "raw_note": edit if edit else submission,
+            "record_type": "submission_edit",
+            "version_id": latest_version_id,
+            "version_timestamp": latest_timestamp,
+            "raw_note": latest_edit,
         })
     version_documents.extend(review_documents)
-    raw_document_count = archive_openreview_documents(forum_id, fetched_at, version_documents)
+    raw_document_count = archive_openreview_documents(
+        forum_id, fetched_at, version_documents, retain_version_ids={latest_version_id}
+    )
 
     archived = load_archived_openreview_notes(forum_id)
     archived_reviews: dict[str, list[OpenReviewReview]] = {item[0]: [] for item in snapshots}
@@ -450,33 +401,27 @@ def fetch_paper(forum_id: str, *, client=None) -> OpenReviewPaper:
         pdf_id = _pdf_identifier(state)
         pdf_cache_key = pdf_id or str(state.get("id") or forum_id)
         pdf_error = None
-        if pdf_id is None and version_id != latest_version_id:
-            # The /pdf?id=<note> form resolves the current attachment. Do not
-            # mislabel that current PDF as the text of an older edit that had
-            # no attachment reference of its own.
-            version_text = ""
-            pdf_error = "No revision-specific PDF reference was available; skipped to avoid using the latest PDF."
-        else:
-            if pdf_cache_key not in text_by_pdf:
-                try:
-                    text_by_pdf[pdf_cache_key] = _openreview_pdf_text(
-                        client, str(state.get("id") or forum_id), pdf_id,
-                        allow_note_fallback=version_id == latest_version_id,
-                    )
-                except OpenReviewPDFError as exc:
-                    pdf_error = str(exc)
-                    pdf_errors[pdf_cache_key] = pdf_error
-                    text_by_pdf[pdf_cache_key] = ""
-            elif not text_by_pdf[pdf_cache_key]:
-                pdf_error = pdf_errors.get(pdf_cache_key, "The referenced PDF could not be extracted.")
-            version_text = text_by_pdf[pdf_cache_key]
+        if pdf_cache_key not in text_by_pdf:
+            try:
+                text_by_pdf[pdf_cache_key] = _openreview_pdf_text(
+                    client, str(state.get("id") or forum_id), pdf_id, allow_note_fallback=True
+                )
+            except OpenReviewPDFError as exc:
+                pdf_error = str(exc)
+                pdf_errors[pdf_cache_key] = pdf_error
+                text_by_pdf[pdf_cache_key] = ""
+        elif not text_by_pdf[pdf_cache_key]:
+            pdf_error = pdf_errors.get(pdf_cache_key, "The referenced PDF could not be extracted.")
+        version_text = text_by_pdf[pdf_cache_key]
         versions.append(OpenReviewVersion(
             version_id=version_id,
             version_timestamp=timestamp,
             title=_content_text(state, "title"),
             abstract=_content_text(state, "abstract"),
+            authors=tuple(_content_values(state, "authors")),
             full_text=version_text,
             is_latest=version_id == latest_version_id,
+            forum_id=forum_id,
             reviews=tuple(archived_reviews.get(version_id, [])),
             pdf_error=pdf_error,
         ))
@@ -507,8 +452,10 @@ def find_matching_forum(
     diagnostics: dict | None = None,
     *,
     authors: tuple[str, ...] | list[str] = (),
+    include_forum_id: str | None = None,
+    seed_paper: OpenReviewPaper | None = None,
 ) -> OpenReviewPaper | None:
-    """Find the newest OpenReview version with a strong title and author match.
+    """Fetch every strongly matching forum and combine its revisions and reviews.
 
     OpenReview's search endpoint is an index, so a long complete-title query can
     miss indexed notes. Several short, overlapping title phrases improve recall;
@@ -550,6 +497,26 @@ def find_matching_forum(
     queries = list(dict.fromkeys(query for query in queries if query.strip()))[:9]
 
     candidates_by_id: dict[str, dict[str, object]] = {}
+    if include_forum_id and seed_paper:
+        latest_seed = max(seed_paper.versions,
+                          key=lambda item: (item.version_timestamp or 0, item.version_id),
+                          default=None)
+        candidates_by_id[include_forum_id] = {
+            "title": seed_paper.title,
+            "authors": latest_seed.authors if latest_seed else tuple(authors),
+            "date": latest_seed.version_timestamp if latest_seed else seed_paper.version_date,
+        }
+    elif include_forum_id:
+        try:
+            note = client.get_note(include_forum_id)
+            candidates_by_id[include_forum_id] = {
+                "title": _content_text(note, "title"),
+                "authors": tuple(_content_values(note, "authors")),
+                "date": (getattr(note, "tcdate", None) or getattr(note, "cdate", None)
+                         or getattr(note, "tmdate", None)),
+            }
+        except Exception as exc:
+            raise LookupError(f"Could not load the requested OpenReview forum {include_forum_id}: {exc}") from exc
     query_failures = []
     for query in dict.fromkeys(queries):
         try:
@@ -638,9 +605,8 @@ def find_matching_forum(
 
     author_scores: dict[str, float | None] = {}
     version_dates: dict[str, int] = {}
-    exact_title_ids = [forum_id for forum_id in strong_title_ids
-                       if normalize(str(candidates_by_id[forum_id]["title"])) == wanted]
-    for forum_id in strong_title_ids:
+    initially_strong_ids = list(strong_title_ids)
+    for forum_id in initially_strong_ids:
         candidate = candidates_by_id[forum_id]
         try:
             # Fetch authoritative author metadata and creation date before
@@ -660,32 +626,27 @@ def find_matching_forum(
         except (TypeError, ValueError):
             version_dates[forum_id] = 0
 
-    if exact_title_ids:
-        author_confirmed_ids = [forum_id for forum_id in exact_title_ids
-                                if (author_scores.get(forum_id) or 0.0) >= author_threshold]
-        # Exact title matches always pass the title gate. Use authors to prefer
-        # matching exact-title versions when that evidence exists, but do not
-        # reject an exact title solely because PDF author extraction was partial.
-        version_pool = author_confirmed_ids or exact_title_ids
-    else:
-        version_pool = [forum_id for forum_id in strong_title_ids
-                        if (author_scores.get(forum_id) or 0.0) >= author_threshold]
-
-    eligible = [(author_scores.get(forum_id), version_dates.get(forum_id, 0), forum_id)
-                for forum_id in version_pool]
-
-    chosen_forum_id = None
-    chosen_title_score = None
-    chosen_author_score = None
-    chosen_date = None
-    if eligible:
-        # Exact titles pass without an author gate. Fuzzy titles must also clear
-        # the author threshold. Among eligible versions, prefer the newest date.
-        chosen_author_score, chosen_date, chosen_forum_id = max(
-            eligible, key=lambda item: (item[1], item[0] or 0.0,
-                                       score(str(candidates_by_id[item[2]]["title"])))
-        )
-        chosen_title_score = score(str(candidates_by_id[chosen_forum_id]["title"]))
+    strong_title_ids = [forum_id for forum_id in initially_strong_ids
+                        if score(str(candidates_by_id[forum_id]["title"])) >= title_threshold]
+    exact_title_ids = [forum_id for forum_id in strong_title_ids
+                       if normalize(str(candidates_by_id[forum_id]["title"])) == wanted]
+    # Collect every forum that meets the existing safe-match rules. Exact
+    # normalized titles pass directly; fuzzy titles require both the title and
+    # author thresholds. These forums can represent separate revisions/venues.
+    eligible_ids = [forum_id for forum_id in strong_title_ids
+                    if (forum_id in exact_title_ids
+                        or (author_scores.get(forum_id) or 0.0) >= author_threshold)]
+    if include_forum_id and include_forum_id not in eligible_ids:
+        eligible_ids.append(include_forum_id)
+    eligible = sorted(eligible_ids,
+                      key=lambda forum_id: (version_dates.get(forum_id, 0),
+                                            author_scores.get(forum_id) or 0.0,
+                                            score(str(candidates_by_id[forum_id]["title"]))),
+                      reverse=True)
+    primary_forum_id = eligible[0] if eligible else None
+    primary_title_score = score(str(candidates_by_id[primary_forum_id]["title"])) if primary_forum_id else None
+    primary_author_score = author_scores.get(primary_forum_id) if primary_forum_id else None
+    primary_date = version_dates.get(primary_forum_id) if primary_forum_id else None
 
     if diagnostics is not None:
         best_title_score, best_title_id = ranked[0]
@@ -694,12 +655,50 @@ def find_matching_forum(
                            best_title=candidates_by_id[best_title_id]["title"],
                            best_score=best_title_score,
                            best_author_score=author_scores.get(best_title_id),
-                           selected_author_score=chosen_author_score,
+                           selected_author_score=primary_author_score,
                            eligible_versions=len(eligible),
-                           selected_version_date=chosen_date,
-                           selected_forum_id=chosen_forum_id)
-    if chosen_forum_id is None:
+                           eligible_forum_ids=eligible,
+                           selected_version_date=primary_date,
+                           selected_forum_id=primary_forum_id)
+    if primary_forum_id is None:
         return None
-    return replace(fetch_paper(chosen_forum_id, client=client),
-                   match_score=chosen_title_score,
-                   author_match_score=chosen_author_score, version_date=chosen_date)
+    fetched = {}
+    if seed_paper and include_forum_id:
+        fetched[include_forum_id] = seed_paper
+    for matched_forum_id in eligible:
+        if matched_forum_id not in fetched:
+            fetched[matched_forum_id] = fetch_paper(matched_forum_id, client=client)
+
+    all_versions = []
+    for matched_forum_id, matched_paper in fetched.items():
+        for version in matched_paper.versions:
+            all_versions.append(replace(version, forum_id=version.forum_id or matched_forum_id,
+                                         is_latest=False))
+    latest_version = max(all_versions,
+                         key=lambda item: (item.version_timestamp or 0,
+                                           item.forum_id or "", item.version_id))
+    all_versions = [replace(version, is_latest=(version is latest_version)) for version in all_versions]
+    primary_forum_id = latest_version.forum_id or primary_forum_id
+    primary_title_score = score(latest_version.title)
+    primary_author_score = author_scores.get(primary_forum_id)
+    if diagnostics is not None:
+        diagnostics.update(selected_forum_id=primary_forum_id,
+                           selected_version_date=latest_version.version_timestamp,
+                           selected_title_score=primary_title_score,
+                           selected_author_score=primary_author_score)
+    return OpenReviewPaper(
+        forum_id=primary_forum_id,
+        title=latest_version.title,
+        abstract=latest_version.abstract,
+        review_count=sum(len(version.reviews) for version in all_versions),
+        match_score=primary_title_score,
+        author_match_score=primary_author_score,
+        version_date=latest_version.version_timestamp,
+        raw_note_count=sum(paper.raw_note_count for paper in fetched.values()),
+        raw_fetched_at=max((paper.raw_fetched_at for paper in fetched.values() if paper.raw_fetched_at),
+                           default=None),
+        full_text=latest_version.full_text,
+        versions=tuple(sorted(all_versions,
+                              key=lambda item: (item.version_timestamp or 0,
+                                                item.forum_id or "", item.version_id))),
+    )

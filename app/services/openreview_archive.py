@@ -18,6 +18,8 @@ def archive_openreview_documents(
     forum_id: str,
     fetched_at: datetime,
     documents: list[dict[str, Any]],
+    *,
+    retain_version_ids: set[str] | None = None,
 ) -> int:
     """Store exact version/edit/review JSON with version-scoped composite keys."""
     settings = get_settings()
@@ -66,6 +68,11 @@ def archive_openreview_documents(
                 }
                 document.update(item.get("archive_metadata", {}))
                 collection.update_one({"_id": document_id}, {"$setOnInsert": document}, upsert=True)
+            if retain_version_ids is not None:
+                collection.delete_many({
+                    "forum_id": forum_id,
+                    "version_id": {"$nin": sorted(retain_version_ids)},
+                })
     except Exception as exc:
         if isinstance(exc, RawArchiveError):
             raise

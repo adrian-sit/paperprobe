@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>PaperProbe</title>
-    <link rel="stylesheet" href="/static/styles.css?v=sectioned-extraction-1" />
+    <link rel="stylesheet" href="/static/styles.css?v=multi-forum-revision-1" />
   </head>
   <body>
     <main class="shell">
@@ -45,13 +45,28 @@
 
       <section id="paper-view" hidden>
         <article class="panel paper-card">
+          <div class="revision-picker">
+            <label for="revision-select">Paper revision</label>
+            <select id="revision-select"></select>
+            <p id="revision-context" class="hint"></p>
+          </div>
           <div class="paper-heading">
             <div><p class="eyebrow">PAPER</p><h2 id="paper-title"></h2></div>
             <a id="source-link" target="_blank" rel="noreferrer">Open on OpenReview</a>
           </div>
+          <p id="paper-authors" class="paper-authors"></p>
           <h3>Abstract</h3>
           <p id="abstract"></p>
         </article>
+
+        <section class="panel reviews-panel">
+          <div class="paper-heading">
+            <div><p class="eyebrow">OPENREVIEW</p><h2>Reviews for this revision</h2></div>
+            <span id="review-count" class="review-count"></span>
+          </div>
+          <p id="reviews-empty" class="hint" hidden>No review text was stored for this revision.</p>
+          <div id="paper-reviews" class="paper-reviews"></div>
+        </section>
 
         <section class="panel">
           <details id="sections-details">
@@ -62,6 +77,7 @@
 
         <section class="panel">
           <p class="eyebrow">GEMINI EXTRACTION</p>
+          <p id="extraction-context" class="hint"></p>
           <div id="extraction-grid" class="extraction-grid"></div>
         </section>
 
@@ -75,6 +91,6 @@
         </section>
       </section>
     </main>
-    <script src="/static/app.js?v=sectioned-extraction-1"></script>
+    <script src="/static/app.js?v=multi-forum-revision-1"></script>
   </body>
 </html>
