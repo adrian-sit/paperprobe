@@ -14,17 +14,17 @@ from app.api.progress import ProgressReporter, progress_response
 from app.core.config import get_settings
 from app.db.models import ExtractedField, Paper, PaperChunk, PaperSection, PaperVersion, Question, Review
 from app.db.session import get_db_session, get_session_factory
-from app.schemas.extraction import AbstractExtraction
 from app.schemas.papers import (
     OpenReviewIngestRequest, PaperDetail, PaperVersionDetail, PaperVersionSummary, QuestionGenerationRequest,
     QuestionGenerationResponse, StoredExtractedField, StoredQuestion, StoredReview, StoredSection,
 )
-from app.services.gemini import extract_abstract, generate_questions
+from app.services.gemini import SectionExtractedField, extract_section_fields, generate_questions
 from app.services.openreview import (
     OpenReviewContentError, OpenReviewPaper, fetch_paper,
     find_matching_forum,
 )
 from app.services.pdf import extract_title_and_abstract
+from app.services.paper_sections import parse_paper_sections, section_field_groups
 
 router = APIRouter()
 MAX_PDF_BYTES = 20 * 1024 * 1024
@@ -55,6 +55,28 @@ def _normalized_field(field_type: str, value):
     return {"text": value} if field_type == "summary" else {"items": value}
 
 
+def _merge_extracted_fields(rows: list[ExtractedField]) -> dict[str, dict]:
+    """Combine same-type results from multiple source sections for question generation."""
+    merged: dict[str, dict] = {}
+    for row in rows:
+        value = row.value or {}
+        if "items" in value:
+            target = merged.setdefault(row.field_type, {"items": []})["items"]
+            for item in value.get("items") or []:
+                if item not in target:
+                    target.append(item)
+        elif "text" in value:
+            target = merged.setdefault(row.field_type, {"text": ""})
+            if not target["text"]:
+                target["text"] = value.get("text", "")
+    return merged
+
+
+def _extract_section_fields(title: str, abstract: str, full_text: str):
+    sections = parse_paper_sections(full_text, abstract)
+    return sections, extract_section_fields(title, sections)
+
+
 async def _load(db: AsyncSession, paper_id: UUID):
     stmt = (select(Paper).options(
         selectinload(Paper.versions).selectinload(PaperVersion.sections),
@@ -74,6 +96,7 @@ def _latest(paper: Paper):
 
 def _serialize(paper: Paper, *, from_cache: bool = False, refreshed: bool = False) -> PaperDetail:
     latest = _latest(paper)
+    section_headings = {section.id: section.heading for section in latest.sections} if latest else {}
     return PaperDetail(
         id=paper.id, source_type=paper.source_type, source_uri=paper.source_uri,
         title=latest.title if latest else paper.title, forum_id=paper.forum_id,
@@ -90,6 +113,7 @@ def _serialize(paper: Paper, *, from_cache: bool = False, refreshed: bool = Fals
         extracted_fields=[StoredExtractedField(
             id=f.id, field_type=f.field_type, value=f.value,
             extraction_model=f.extraction_model, prompt_version=f.prompt_version,
+            section_id=f.section_id, section_heading=section_headings.get(f.section_id),
         ) for f in latest.extracted_fields] if latest else [],
         reviews=[StoredReview(
             id=r.id, openreview_note_id=r.openreview_note_id, review_text=r.review_text,
@@ -102,7 +126,7 @@ def _serialize(paper: Paper, *, from_cache: bool = False, refreshed: bool = Fals
 
 async def _store(
     db: AsyncSession, *, source: OpenReviewPaper | None, title: str, abstract: str,
-    full_text: str, extraction: AbstractExtraction, source_type: str, source_uri: str,
+    full_text: str, extraction: list[SectionExtractedField], source_type: str, source_uri: str,
     metadata: dict, upload_digest: str | None = None,
 ) -> PaperDetail:
     forum_id = source.forum_id if source else None
@@ -162,12 +186,21 @@ async def _store(
                                 "full_text_characters": len(item.full_text or ""),
                                 "pdf_error": item.pdf_error,
                                 "full_text_source": item.full_text_source}
+        # Provenance points at section rows, so remove stale field rows before
+        # replacing the section set. Only the latest revision is re-extracted.
+        await db.execute(delete(ExtractedField).where(ExtractedField.paper_version_id == version.id))
         await db.execute(delete(PaperSection).where(PaperSection.paper_version_id == version.id))
-        if item.abstract:
-            db.add(PaperSection(
-                paper_id=paper.id, paper_version_id=version.id, position=0,
-                heading="Abstract", content=item.abstract,
-            ))
+        section_rows = []
+        parsed_sections = parse_paper_sections(item.full_text or "", item.abstract or "")
+        for section in parsed_sections:
+            section_row = PaperSection(
+                paper_id=paper.id, paper_version_id=version.id, position=section.position,
+                heading=section.heading, content=section.content,
+            )
+            db.add(section_row)
+            section_rows.append(section_row)
+        await db.flush()
+        section_ids = {section.position: section.id for section in section_rows}
         await db.execute(delete(Review).where(Review.paper_version_id == version.id))
         for review in item.reviews:
             db.add(Review(
@@ -183,12 +216,13 @@ async def _store(
                 token_count=None, embedding=None,
             ))
         if item.is_latest:
-            await db.execute(delete(ExtractedField).where(ExtractedField.paper_version_id == version.id))
-            for field_type, value in extraction.model_dump().items():
+            for extracted in extraction:
                 db.add(ExtractedField(
-                    paper_version_id=version.id, section_id=None, field_type=field_type,
-                    value=_normalized_field(field_type, value),
-                    extraction_model=get_settings().gemini_model, prompt_version="abstract-v1",
+                    paper_version_id=version.id,
+                    section_id=section_ids.get(extracted.section_position),
+                    field_type=extracted.field_type,
+                    value=_normalized_field(extracted.field_type, extracted.value),
+                    extraction_model=get_settings().gemini_model, prompt_version="section-v1",
                 ))
     await db.flush()
     await db.execute(update(Question).where(Question.paper_id == paper.id).values(status="stale"))
@@ -226,10 +260,15 @@ async def _ingest_forum(db: AsyncSession, forum_id: str, report=None) -> PaperDe
         await report("lookup", "Fetch from OpenReview", fetch_state,
                      fetch_detail)
         await report("extraction", "Extract paper fields", "running",
-                     "Gemini is extracting structured fields from the latest revision abstract.")
-    extraction = await asyncio.to_thread(extract_abstract, source.title, source.abstract)
+                     "Parsing the latest revision into named sections, then extracting fields section by section.")
+    parsed_sections, extraction = await asyncio.to_thread(
+        _extract_section_fields, source.title, source.abstract, source.full_text
+    )
     if report:
-        await report("extraction", "Extract paper fields", "success", "Latest-version extraction completed.")
+        call_sections = section_field_groups(parsed_sections)
+        names = ", ".join(section.heading for section, _fields in call_sections) or "none"
+        await report("extraction", "Extract paper fields", "success",
+                     f"Completed {len(call_sections)} focused Gemini call(s) for: {names}.")
         await report("save", "Save paper", "running",
                      "Saving forum, revisions, reviews, full text, and text chunks to PostgreSQL.")
     result = await _store(
@@ -340,10 +379,16 @@ async def _ingest_upload(db: AsyncSession, file: UploadFile, data: bytes, report
         source_uri, source_type = f"paperprobe-upload://sha256/{digest}", "upload"
         metadata = {"uploaded_filename": file.filename, "uploaded_pdf_sha256": digest, "openreview_match": False}
     if report:
-        await report("extraction", "Extract paper fields", "running", "Gemini is extracting from the latest abstract.")
-    extraction = await asyncio.to_thread(extract_abstract, title, abstract)
+        await report("extraction", "Extract paper fields", "running",
+                     "Parsing uploaded full text into named sections, then extracting fields section by section.")
+    parsed_sections, extraction = await asyncio.to_thread(
+        _extract_section_fields, title, abstract, full_text
+    )
     if report:
-        await report("extraction", "Extract paper fields", "success", "Structured extraction completed.")
+        call_sections = section_field_groups(parsed_sections)
+        names = ", ".join(section.heading for section, _fields in call_sections) or "none"
+        await report("extraction", "Extract paper fields", "success",
+                     f"Completed {len(call_sections)} focused Gemini call(s) for: {names}.")
         await report("save", "Save paper", "running", "Saving version-scoped text, reviews, and chunks.")
     result = await _store(db, source=source, title=title, abstract=abstract, full_text=full_text,
                           extraction=extraction, source_type=source_type, source_uri=source_uri,
@@ -393,15 +438,15 @@ async def _generate(db: AsyncSession, paper_id: UUID, count: int, report=None):
     if not paper:
         raise ValueError("Paper not found.")
     version = _latest(paper)
-    if not version or not version.abstract:
-        raise ValueError("This paper has no stored abstract for question generation.")
+    if not version or (not version.abstract and not version.extracted_fields):
+        raise ValueError("This paper has no abstract or extracted fields for question generation.")
     if report:
         await report("load", "Load paper context", "success",
                      f"Loaded latest revision {version.version_key} and its extracted fields.")
         await report("generate", "Generate discussion questions", "running", f"Drafting {count} questions.")
-    fields = {field.field_type: field.value for field in version.extracted_fields}
+    fields = _merge_extracted_fields(version.extracted_fields)
     generated = await asyncio.to_thread(generate_questions, version.title or paper.title or "Untitled",
-                                        version.abstract, fields, count)
+                                        version.abstract or "", fields, count)
     if report:
         await report("generate", "Generate discussion questions", "success",
                      f"Generated {len(generated.questions)} questions.")
@@ -445,7 +490,8 @@ async def get_paper(paper_id: UUID, db: AsyncSession = Depends(get_db_session)):
 async def get_paper_version(paper_id: UUID, version_id: UUID,
                             db: AsyncSession = Depends(get_db_session)):
     version = await db.scalar(select(PaperVersion).options(
-        selectinload(PaperVersion.extracted_fields), selectinload(PaperVersion.reviews)
+        selectinload(PaperVersion.sections), selectinload(PaperVersion.extracted_fields),
+        selectinload(PaperVersion.reviews)
     ).where(PaperVersion.id == version_id, PaperVersion.paper_id == paper_id))
     if not version:
         raise HTTPException(404, detail="Paper version not found.")
@@ -454,9 +500,13 @@ async def get_paper_version(paper_id: UUID, version_id: UUID,
         version_timestamp=version.version_timestamp, is_latest=version.is_latest,
         title=version.title, abstract=version.abstract, paper_text=version.paper_text,
         pdf_error=(version.raw_metadata or {}).get("pdf_error"),
+        sections=[StoredSection(id=s.id, position=s.position, heading=s.heading, content=s.content)
+                  for s in sorted(version.sections, key=lambda s: s.position)],
         extracted_fields=[StoredExtractedField(
             id=f.id, field_type=f.field_type, value=f.value,
             extraction_model=f.extraction_model, prompt_version=f.prompt_version,
+            section_id=f.section_id,
+            section_heading=next((s.heading for s in version.sections if s.id == f.section_id), None),
         ) for f in version.extracted_fields],
         reviews=[StoredReview(
             id=r.id, openreview_note_id=r.openreview_note_id, review_text=r.review_text,

@@ -78,7 +78,7 @@ Early, high-level thinking on the first two pieces of the pipeline. Details (sch
 - Raw review text is treated as source data for local processing only; it will not be committed to the repo or redistributed in bulk. Only derived artifacts (extracted fields, generated questions, aggregate stats) are shared publicly.
 
 ### Gemini-based extraction
-- Gemini API (free tier) used for the structured extraction step: turning raw paper text into claims, methods, datasets, baselines, and limitations via a schema-constrained prompt (JSON output).
+- Gemini is called once per relevant parsed paper section, with a schema containing only that section's requested fields. This turns section text into summaries, claims, methods, datasets, baselines, and limitations.
 - Model choice is swappable behind a thin interface so extraction and generation can move to the fine-tuned/vLLM-served model once it's ready, without rewriting the pipeline around it.
 - Extraction prompts are versioned so quality can be tracked as they're iterated on, rather than silently changing.
 
@@ -141,6 +141,9 @@ Alembic creates the forum/revision tables and enables the PostgreSQL `vector`
 extension. Existing pre-versioning rows are migrated into one `legacy` paper
 version, including their abstract and any saved full text. New schema changes
 should be added as migrations and applied with `alembic upgrade head`.
+The section-extraction migration indexes the existing `extracted_fields.section_id`
+relationship. Existing stored papers are not automatically re-extracted; submit
+their forum IDs again or upload them again to parse sections and populate field provenance.
 
 ### Local MongoDB raw archive
 
@@ -200,26 +203,41 @@ snapshot; PostgreSQL is the queryable application model.
    `paper_text`. A unique forum ID prevents duplicate forum roots. Re-ingesting
    a forum refreshes its existing versions and reviews so newly posted revisions
    and reviews are discovered; it does not short-circuit on a cached paper.
-5. **Attach version-dependent data.** `extracted_fields` references a version,
-   and the current Gemini extraction runs against the latest version's abstract.
-   `reviews` stores review text read back from the Mongo archive, along with
-   raw content and OpenReview note metadata. Review rows reference the assigned
-   version. `paper_sections` and `questions` also retain their version link.
-6. **Prepare full text for retrieval.** Every version's `paper_text` is split
+5. **Parse and store named sections.** Each version's readable full text is
+   split at recognized standalone headers such as Abstract, Introduction,
+   Related Work, Method, Experiments, Limitations, Discussion, and Conclusion.
+   Header matching is heuristic; unrecognized text is retained in a `Full Text`
+   section, and OpenReview's abstract is added when the PDF has no Abstract
+   heading. The resulting `paper_sections` rows retain the heading, order, and
+   section text. They do not currently store source character offsets or page
+   ranges.
+6. **Extract fields by section.** Only the latest revision is sent to Gemini for
+   structured extraction. PaperProbe makes one focused call for each section
+   assigned fields, rather than sending the whole paper in one request. Summary
+   and claims are sought in Abstract/Introduction; methods in Method; datasets
+   and baselines in Experiments; limitations in Limitations, Conclusion, or
+   Discussion. If a preferred section is missing, its fields fall back to the
+   available section text. Each result is saved in `extracted_fields` with a
+   `section_id` foreign key, plus the Gemini model and `section-v1` prompt
+   version; API responses resolve the section ID to its heading. Multiple rows
+   of the same field type can preserve results from different source sections.
+   `reviews` stores review text read back from MongoDB, along with raw content and OpenReview note
+   metadata; review rows reference the assigned version. Questions also retain
+   their version link.
+7. **Prepare full text for retrieval.** Every version's `paper_text` is split
    into overlapping chunks in `paper_chunks` (about 3,000 characters per chunk
    with a 300-character overlap, preferring nearby paragraph/sentence boundaries).
    The table has a pgvector `embedding vector(768)` column and an embedding-model
    field. Chunk records are currently populated, while token counts and embeddings
    are left null until an embedding model/job is selected and wired into ingestion.
    This keeps the database ready for semantic retrieval without fabricating vectors.
-7. **Generate questions.** The existing question endpoint uses the latest
-   version's abstract and extracted fields. If forum-ID PDF retrieval fails,
-   this available metadata still supports the existing generation path. Uploaded
-   and fetched PDF text is stored in `paper_text` and `paper_chunks` for local
-   downstream use; it is not currently sent to Gemini. Generated questions store
-   both the forum-level paper ID and the exact version ID that supplied the
-   context. The versioned body, reviews, and chunks are available for future
-   retrieval-based generation.
+8. **Generate questions.** The question endpoint uses the latest version's
+   abstract and merged extracted fields, which are now derived from relevant
+   full-text sections. If forum-ID PDF retrieval fails, extraction falls back to
+   the available abstract or other parsed section text. Generated questions
+   store both the forum-level paper ID and the exact version ID that supplied
+   the context. The versioned body, reviews, and chunks remain available for
+   future retrieval-based generation.
 
 Uploaded PDFs and PDFs fetched from OpenReview both populate
 `paper_versions.paper_text`. PDF extraction reads embedded text; scanned pages
@@ -275,7 +293,8 @@ under one forum record; otherwise, the PDF is stored as a one-version local pape
 4. Among qualifying candidates, PaperProbe prefers exact-title candidates with
    author evidence when available, then selects the newest forum creation date
    (`tcdate`, falling back to `cdate`). It fetches that forum's edit history and
-   all its revisions; Gemini uses the latest revision's abstract. If no candidate
+   all its revisions; section-scoped Gemini extraction uses the latest revision's
+   parsed full text. If no candidate
    qualifies, it uses the uploaded PDF's title and abstract.
 
 Both matched and PDF-only papers continue through the same Gemini extraction and
@@ -314,8 +333,9 @@ Run the initial test suite with `pytest`.
 ### External API smoke test
 
 The standalone smoke test fetches one public OpenReview forum and prints its
-submission, abstract, and first review. With `--run-gemini`, it then sends only
-the title and abstract to Gemini and prints a Pydantic-validated JSON extraction.
+submission, abstract, and first review. With `--run-gemini`, it sends only the
+title and abstract to Gemini as a lightweight connectivity/schema check; it does
+not exercise the FastAPI pipeline's section parser or section-scoped extraction.
 It does not call the FastAPI server, write to PostgreSQL, or persist source text.
 
 Set a public forum ID in `.env` as `OPENREVIEW_FORUM_ID`, install the optional

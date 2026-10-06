@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>PaperProbe</title>
-    <link rel="stylesheet" href="/static/styles.css?v=activity-1" />
+    <link rel="stylesheet" href="/static/styles.css?v=sectioned-extraction-1" />
   </head>
   <body>
     <main class="shell">
@@ -54,6 +54,13 @@
         </article>
 
         <section class="panel">
+          <details id="sections-details">
+            <summary>Parsed paper sections</summary>
+            <div id="paper-sections" class="paper-sections"></div>
+          </details>
+        </section>
+
+        <section class="panel">
           <p class="eyebrow">GEMINI EXTRACTION</p>
           <div id="extraction-grid" class="extraction-grid"></div>
         </section>
@@ -63,11 +70,11 @@
             <div><p class="eyebrow">DISCUSSION QUESTIONS</p><h2>Interrogate the paper</h2></div>
             <button id="question-button" type="button">Generate 5 questions</button>
           </div>
-          <p class="hint">Questions use only the title, abstract, and extracted fields already stored for this paper.</p>
+          <p class="hint">Questions use the title, abstract, and extracted fields saved from the paper's sections.</p>
           <ol id="questions" class="questions"></ol>
         </section>
       </section>
     </main>
-    <script src="/static/app.js?v=activity-1"></script>
+    <script src="/static/app.js?v=sectioned-extraction-1"></script>
   </body>
 </html>

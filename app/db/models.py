@@ -92,6 +92,7 @@ class PaperSection(Base):
 
 class ExtractedField(Base):
     __tablename__ = "extracted_fields"
+    __table_args__ = (Index("ix_extracted_fields_section_id", "section_id"),)
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     paper_version_id: Mapped[uuid.UUID] = mapped_column(

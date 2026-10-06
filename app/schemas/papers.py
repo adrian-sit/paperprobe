@@ -21,6 +21,8 @@ class StoredExtractedField(BaseModel):
     value: dict
     extraction_model: str | None
     prompt_version: str | None
+    section_id: UUID | None = None
+    section_heading: str | None = None
 
 
 class PaperVersionSummary(BaseModel):
@@ -52,6 +54,7 @@ class PaperVersionDetail(BaseModel):
     abstract: str | None
     paper_text: str | None
     pdf_error: str | None = None
+    sections: list[StoredSection] = Field(default_factory=list)
     extracted_fields: list[StoredExtractedField]
     reviews: list[StoredReview]
 

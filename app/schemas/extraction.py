@@ -3,14 +3,23 @@ from pydantic import BaseModel, Field
 
 class Claim(BaseModel):
     statement: str
+    evidence_from_section: str | None = Field(
+        default=None, description="A short supporting passage paraphrase from this section."
+    )
+
+
+class AbstractClaim(BaseModel):
+    """Legacy response shape used by the standalone metadata-only smoke command."""
+
+    statement: str
     evidence_from_abstract: str | None = None
 
 
 class AbstractExtraction(BaseModel):
-    """Structured fields inferred only from a paper title and abstract."""
+    """Legacy title/abstract schema used only by the standalone API smoke command."""
 
     summary: str = Field(description="One or two sentences based only on the abstract.")
-    claims: list[Claim] = Field(default_factory=list)
+    claims: list[AbstractClaim] = Field(default_factory=list)
     methods: list[str] = Field(default_factory=list)
     datasets: list[str] = Field(default_factory=list)
     baselines: list[str] = Field(default_factory=list)

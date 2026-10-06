@@ -102,14 +102,30 @@ async function request(url, options = {}) {
 function renderExtraction(fields) {
   const grid = document.querySelector('#extraction-grid');
   grid.replaceChildren();
-  fields.forEach(({ field_type: name, value }) => {
+  fields.forEach(({ field_type: name, value, section_heading: sectionHeading }) => {
     const card = document.createElement('article'); card.className = 'field';
     const title = document.createElement('h3'); title.textContent = name.replaceAll('_', ' '); card.append(title);
+    if (sectionHeading) {
+      const source = document.createElement('p'); source.className = 'field-source';
+      source.textContent = `Source section: ${sectionHeading}`; card.append(source);
+    }
     const values = value.items || (value.text ? [value.text] : []);
     if (values.length) { const list = document.createElement('ul'); values.forEach(item => { const li = document.createElement('li'); li.textContent = typeof item === 'string' ? item : item.statement; list.append(li); }); card.append(list); }
-    else { const empty = document.createElement('p'); empty.textContent = 'Not identified from the abstract.'; card.append(empty); }
+    else { const empty = document.createElement('p'); empty.textContent = 'Not identified in this section.'; card.append(empty); }
     grid.append(card);
   });
+}
+
+function renderSections(sections) {
+  const container = document.querySelector('#paper-sections');
+  container.replaceChildren();
+  sections.forEach(section => {
+    const details = document.createElement('details'); details.className = 'paper-section';
+    const summary = document.createElement('summary'); summary.textContent = section.heading || `Section ${section.position + 1}`;
+    const text = document.createElement('pre'); text.textContent = section.content;
+    details.append(summary, text); container.append(details);
+  });
+  document.querySelector('#sections-details').open = false;
 }
 
 function renderPaper(paper) {
@@ -120,6 +136,7 @@ function renderPaper(paper) {
   sourceLink.href = paper.source_uri;
   sourceLink.hidden = paper.source_type === 'upload';
   document.querySelector('#abstract').textContent = paper.sections.find(section => section.heading === 'Abstract')?.content || 'No abstract stored.';
+  renderSections(paper.sections || []);
   document.querySelector('#questions').replaceChildren();
   renderExtraction(paper.extracted_fields);
 }
