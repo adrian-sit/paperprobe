@@ -10,7 +10,7 @@ The project has two purposes:
 1. Build the best version I can of a tool for critically reading research papers.
 2. Serve as a hands-on project for LLM application engineering, covering APIs, backends, databases, fine-tuning, orchestration, and deployment.
 
-The system draws on prompting, retrieval, fine-tuning, and agentic workflows as complementary techniques, combined into a single pipeline aimed at the strongest overall result, rather than treated as separate options to benchmark against each other.
+The system draws on prompting, retrieval, fine-tuning, and agentic workflows as complementary techniques, combined into a single pipeline aimed at the strongest overall result.
 
 ## Motivation
 
@@ -28,7 +28,7 @@ I took an LLM-paper seminar class, and whenever I tried to ask an LLM to think o
 
 ### Project Goals
 - Generate discussion questions that are specific, answerable, critical, and closely tied to the paper
-- Combine prompting, retrieval, fine-tuning, and agentic workflows into the strongest single pipeline, using evaluation to guide decisions rather than to produce a formal comparison
+- Combine prompting, retrieval, fine-tuning, and agentic workflows into the strongest single pipeline
 - Close the loop: user feedback and edits become future training and evaluation data
 
 ## Planned Features
@@ -47,7 +47,7 @@ The core pipeline isn't a single prompt, it's a small sequence of steps where th
 4. (Later, optional) Tool using step for example pulling citation details, or other tasks to be added to the workflow
 
 ### Models and evaluation
-- LoRA / QLoRA fine-tuning on filtered reviewer questions, aimed at improving the deployed pipeline rather than a standalone comparison
+- LoRA / QLoRA fine-tuning on filtered reviewer questions
 - Evaluation with embedding similarity, LLM-as-judge rubrics, and human ratings, used to guide iteration and catch regressions
 - Latency/throughput benchmarks for the serving setup
 
