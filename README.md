@@ -204,7 +204,9 @@ snapshot; PostgreSQL is the queryable application model.
    a forum refreshes its existing versions and reviews so newly posted revisions
    and reviews are discovered; it does not short-circuit on a cached paper.
 5. **Parse and store named sections.** Each version's readable full text is
-   split at recognized standalone headers such as Abstract, Introduction,
+   first cleaned of repeated three/four-digit line-number gutters when those
+   labels form a clear sequence. Then it is split at recognized standalone
+   headers such as Abstract, Introduction,
    Related Work, Method, Experiments, Limitations, Discussion, and Conclusion.
    Header matching is heuristic; unrecognized text is retained in a `Full Text`
    section, and OpenReview's abstract is added when the PDF has no Abstract

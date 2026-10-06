@@ -3,6 +3,8 @@ from difflib import SequenceMatcher
 from io import BytesIO
 import re
 
+from app.services.paper_sections import strip_line_number_artifacts
+
 
 @dataclass(frozen=True)
 class UploadedPaper:
@@ -20,7 +22,7 @@ def extract_pdf_text(data: bytes) -> str:
         raise RuntimeError("PDF support is missing. Install the project dependencies.") from exc
     reader = PdfReader(BytesIO(data))
     pages = [page.extract_text() or "" for page in reader.pages]
-    full_text = "\n\n".join(page.strip() for page in pages if page.strip())
+    full_text = strip_line_number_artifacts("\n\n".join(page.strip() for page in pages if page.strip()))
     if not full_text:
         raise ValueError("Could not extract readable text from this PDF.")
     return full_text
@@ -161,8 +163,10 @@ def extract_title_and_abstract(data: bytes) -> UploadedPaper:
         raise RuntimeError("PDF support is missing. Install the project dependencies.") from exc
     reader = PdfReader(BytesIO(data))
     page_texts = [page.extract_text() or "" for page in reader.pages]
-    text = "\n".join(page_texts[:8])
-    full_text = "\n\n".join(page.strip() for page in page_texts if page.strip())
+    text = strip_line_number_artifacts("\n".join(page_texts[:8]))
+    full_text = strip_line_number_artifacts(
+        "\n\n".join(page.strip() for page in page_texts if page.strip())
+    )
     lines = [" ".join(line.split()) for line in text.splitlines() if line.strip()]
     abstract_index = next(
         (i for i, line in enumerate(lines) if line.casefold().strip(" :") == "abstract"), None

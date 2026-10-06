@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass
 
 
@@ -51,6 +52,46 @@ _CATEGORY_LABELS = {
 
 _NUMBER_PREFIX = re.compile(r"^\s*(?:\d+(?:\.\d+)*\.?\s+)?")
 _TRAILING_MARKS = re.compile(r"[\s:：.]+$")
+_STANDALONE_LINE_NUMBER = re.compile(r"^\s*(\d{3,4})\s*$")
+_PREFIXED_LINE_NUMBER = re.compile(r"^\s*(\d{3,4})[ \t]+(?=\S)")
+
+
+def strip_line_number_artifacts(text: str) -> str:
+    """Remove a repeated numeric line-number gutter without deleting isolated numbers."""
+    lines = (text or "").replace("\r", "\n").split("\n")
+    number_lines: dict[int, str] = {}
+    values: list[int] = []
+    for index, line in enumerate(lines):
+        standalone = _STANDALONE_LINE_NUMBER.fullmatch(line)
+        prefixed = _PREFIXED_LINE_NUMBER.match(line)
+        match = standalone or prefixed
+        if match:
+            number_lines[index] = "standalone" if standalone else "prefixed"
+            values.append(int(match.group(1)))
+
+    # Line-number gutters usually form a mostly consecutive sequence (sometimes
+    # restarting at a page boundary). Require several observations and a strong
+    # dominant increment so normal years, equations, and enumerated prose survive.
+    if len(values) < 4:
+        return text or ""
+    increments = [right - left for left, right in zip(values, values[1:]) if right > left]
+    resets = sum(right <= left and right <= 3 for left, right in zip(values, values[1:]))
+    if not increments:
+        return text or ""
+    increment, count = Counter(increments).most_common(1)[0]
+    supported_steps = count + resets
+    if increment > 10 or supported_steps / (len(values) - 1) < 0.75:
+        return text or ""
+
+    remove = {index for index, kind in number_lines.items() if kind == "standalone"}
+    cleaned: list[str] = []
+    for index, line in enumerate(lines):
+        if index in remove:
+            continue
+        if number_lines.get(index) == "prefixed":
+            line = _PREFIXED_LINE_NUMBER.sub("", line, count=1)
+        cleaned.append(line)
+    return "\n".join(cleaned)
 
 
 def _match_heading(line: str) -> tuple[str, str] | None:
@@ -80,7 +121,8 @@ def parse_paper_sections(text: str, abstract_fallback: str = "") -> list[PaperTe
     papers remain usable as a single Full Text section, and OpenReview's abstract
     is retained as a section when the PDF text omits an Abstract heading.
     """
-    lines = (text or "").replace("\r", "\n").split("\n")
+    text = strip_line_number_artifacts(text or "")
+    lines = text.replace("\r", "\n").split("\n")
     markers: list[tuple[int, str, str]] = []
     for index, raw_line in enumerate(lines):
         line = " ".join(raw_line.split())
