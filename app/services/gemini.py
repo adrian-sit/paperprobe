@@ -131,8 +131,10 @@ def propose_questions(
     extracted_fields: dict[str, dict],
     count: int = 5,
     paper_text: str = "",
+    review_context: list[dict] | None = None,
+    example_questions: list[dict] | None = None,
 ) -> QuestionGeneration:
-    """Propose grounded peer-review questions from supplied paper evidence."""
+    """Propose grounded questions using paper evidence, reviews, and similar-paper examples."""
     try:
         from google import genai
         from google.genai import types
@@ -148,14 +150,22 @@ def propose_questions(
     context = {"title": title, "abstract": abstract, "extracted_fields": extracted_fields}
     if paper_text.strip():
         context["paper_text"] = paper_text
+    if review_context:
+        context["review_context"] = review_context
+    if example_questions:
+        context["example_questions"] = example_questions
     response = genai.Client(api_key=settings.gemini_api_key).models.generate_content(
         model=settings.gemini_model,
         contents=(
             f"Propose exactly {count} distinct questions for a peer-review discussion. "
             "Prefer questions that probe evidence, assumptions, methodology, scope, or limitations. "
             "Each question must be specific, answerable, and supported by the supplied paper context. "
-            "Do not ask for facts already answered plainly in the context. Do not invent claims or "
-            "cite outside work. Give each question a short focus and explain why it is useful.\n\n"
+            "Use review_context from all available revisions to avoid repeating reviewer comments and to "
+            "build on concerns that later revisions may not have resolved. Do not ask for facts already "
+            "answered plainly in the context. Do not invent claims or "
+            "cite outside work. Treat example_questions as paper-conditioned few-shot guidance: use them "
+            "to understand useful question patterns, but do not copy them or assume their paper-specific "
+            "facts apply to this paper. Give each question a short focus and explain why it is useful.\n\n"
             f"Paper context:\n{context}"
         ),
         config=types.GenerateContentConfig(
@@ -178,8 +188,9 @@ def critique_question(
     abstract: str = "",
     extracted_fields: dict[str, dict] | None = None,
     paper_text: str = "",
+    review_context: list[dict] | None = None,
 ) -> QuestionCritique:
-    """Assess a candidate question for grounding, answerability, specificity, and value."""
+    """Assess a candidate question against paper evidence and versioned reviewer context."""
     try:
         from google import genai
         from google.genai import types
@@ -197,6 +208,8 @@ def critique_question(
     }
     if paper_text.strip():
         context["paper_text"] = paper_text
+    if review_context:
+        context["review_context"] = review_context
     response = genai.Client(api_key=settings.gemini_api_key).models.generate_content(
         model=settings.gemini_model,
         contents=(
@@ -206,7 +219,9 @@ def critique_question(
             "Critical value means the answer could clarify evidence, assumptions, limitations, or "
             "implications. Use keep only when it is already strong, revise when a specific grounded "
             "improvement is possible, and reject when it is ungrounded, unanswerable, or low-value. "
-            "Do not reward generic wording. Provide a revised question only for revise.\n\n"
+            "Check review_context across all paper versions: flag a question that duplicates an existing "
+            "reviewer comment, and consider whether it usefully probes a concern that later revisions "
+            "may not have resolved. Do not reward generic wording. Provide a revised question only for revise.\n\n"
             f"Paper context:\n{context}\n\nCandidate question:\n{question}"
         ),
         config=types.GenerateContentConfig(

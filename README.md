@@ -1,50 +1,46 @@
 # PaperProbe
 
-**A research paper review assistant that extracts key information from papers and generates critical, deeply-related discussion questions, using fine-tuned and API-based LLMs behind a full-stack, agentic pipeline.**
+**A research paper review assistant that extracts key information from papers and generates critical, deeply related discussion questions with LLM-powered tools.**
 
 ## Overview
 
 PaperProbe takes a research paper (PDF or library entry), parses it, extracts structured information (claims, methods, datasets, baselines, limitations), retrieves related work and known reviewer critiques, and generates discussion questions similar to what a thoughtful peer reviewer would ask. Questions aren't limited to facts stated directly in the paper; they can raise broader implications, related work, or open problems, as long as they stay critical and closely tied to the paper's actual content.
 
 The project has two purposes:
-1. Build the best version I can of a tool for critically reading research papers.
-2. Serve as a hands-on project for LLM application engineering, covering APIs, backends, databases, fine-tuning, orchestration, and deployment.
+1. Build a useful tool for critically reading research papers.
+2. Explore LLM application engineering across APIs, backends, databases, and orchestration.
 
-The system draws on prompting, retrieval, fine-tuning, and agentic workflows as complementary techniques, combined into a single pipeline aimed at the strongest overall result.
+The application combines structured prompting and retrieval. Its existing UI flow remains available, with an agentic workflow planned as an additional way to work with a prepared paper.
 
 ## Motivation
 
-I took an LLM-paper seminar class, and whenever I tried to ask an LLM to think of discussion questions based on a paper, it always generated very superficial or strange questions. In class, however, many people asked genuinely insightful questions, and I learned a lot about how to critique different papers. I wanted to explore whether there are methods for an LLM to learn how to ask better questions, using an example dataset I have for fine-tuning and through agentic workflows. For example, learning from online peer reviews of other papers, or other methods.
+I took an LLM-paper seminar class, and whenever I asked an LLM to think of discussion questions based on a paper, it often generated superficial or strange questions. In class, people asked insightful questions, and I learned a lot from seeing how they critiqued papers. I want to help readers develop similarly useful questions grounded in a paper's content. The planned agentic workflow will let the application choose which available analysis operations are useful for a particular paper.
 
 ## Goals
 ### Learning Goals
 - Integrate LLM APIs, including structured outputs, tool use, and prompt versioning
 - Design and build REST APIs with FastAPI
 - Work with both relational (PostgreSQL) and NoSQL databases
-- Fine-tune open models with LoRA and other PEFT methods
 - Build agentic workflows and orchestration (LangChain, LangGraph)
-- Serve models efficiently with vLLM, including LoRA-adapter serving
 - Apply software engineering principles: testing, typing, modular design, version control, CI, containerization, observability
 
 ### Project Goals
 - Generate discussion questions that are specific, answerable, critical, and closely tied to the paper
-- Combine prompting, retrieval, fine-tuning, and agentic workflows into the strongest single pipeline
-- Improve question quality through evaluation and iterative development; model fine-tuning remains a future direction
+- Combine structured prompting, retrieval, and agentic workflows to support critical paper discussion
+- Improve question quality through evaluation and iterative development
 
 ## Planned Features
 ### Core Pipeline
 - PDF ingestion and section-aware parsing
 - Structured extraction of claims, methods, datasets, baselines, and limitations
 - Discussion question generation with a critic/revision loop
-- Retrieval of related papers and reviewer critiques
+- Retrieval of related papers, reviewer critiques, and paper-conditioned question examples
 
 ### Agentic Workflow
 The agentic workflow will be an option launched from the existing UI for a selected paper, alongside the current application flow. The agent will choose which available paper operations to use, reuse suitable stored fields, and generate and critique questions. The workflow will grow incrementally as design adds more useful agent capabilities; the current design and extension points are described in [Agentic workflow design](#agentic-workflow-design).
 
 ### Models and evaluation
-- Future direction: LoRA / QLoRA fine-tuning on filtered reviewer questions
 - Evaluation with embedding similarity, LLM-as-judge rubrics, and offline human ratings, used to guide iteration and catch regressions
-- Latency/throughput benchmarks for the serving setup
 
 ### Platform
 - FastAPI backend with async jobs and streaming responses
@@ -52,16 +48,6 @@ The agentic workflow will be an option launched from the existing UI for a selec
 - Extend the existing web UI with an action to start the agentic workflow for a selected paper
 - Tracing and observability for LLM calls and agent runs
   
-## Dataset
-### Planned sources:
-- OpenReview: papers, reviews, and discussion threads collected through the official API, used to build a question-generation dataset from reviewer comments
-- Personal annotations: my collected criticisms and questions on selected papers, as a small, high-quality set
-
-### Planned handling:
-- Filter reviewer questions for specificity and quality before fine-tuning
-- Split train/validation/test by paper, not by review, to avoid leakage
-- Raw data will not be committed to the repository unless permitted
-
 ## Initial Design Notes
 Early, high-level thinking on the first two pieces of the pipeline. Details (schemas, retry logic, prompt formats) will be worked out during implementation.
 
@@ -73,15 +59,7 @@ Early, high-level thinking on the first two pieces of the pipeline. Details (sch
 
 ### Gemini-based extraction
 - Gemini is called once per relevant parsed paper section, with a schema containing only that section's requested fields. This turns section text into summaries, claims, methods, datasets, baselines, and limitations.
-- Model choice is swappable behind a thin interface so extraction and generation can move to the fine-tuned/vLLM-served model once it's ready, without rewriting the pipeline around it.
 - Extraction prompts are versioned so quality can be tracked as they're iterated on, rather than silently changing.
-
-## Roadmap (High Level)
-1. Foundation: data collection, database schema, FastAPI backend, LLM API extraction
-2. Retrieval and orchestration: vector search, first agentic workflow
-3. Fine-tuning: dataset construction and LoRA/QLoRA experiments
-4. Serving and evaluation: vLLM deployment, benchmarks, iteration based on evaluation results
-5. Integration: UI launch for agentic runs, observability
 
 ## Project Structure
 
@@ -236,8 +214,9 @@ snapshot; PostgreSQL is the queryable application model.
    with a 300-character overlap, preferring nearby paragraph/sentence boundaries).
    The table has a pgvector `embedding vector(768)` column and an embedding-model
    field. Chunk records are currently populated, while token counts and embeddings
-   are left null until an embedding model/job is selected and wired into ingestion.
-   This keeps the database ready for semantic retrieval without fabricating vectors.
+   are left null until a dedicated chunk-embedding job is wired into ingestion.
+   This keeps the database ready for chunk retrieval without fabricating vectors;
+   example-pair embeddings are stored separately for paper-conditioned retrieval.
 8. **Generate questions.** The question endpoint uses the latest version's
    abstract and merged extracted fields, which are now derived from relevant
    full-text sections. If forum-ID PDF retrieval fails, extraction falls back to
@@ -262,15 +241,15 @@ continues to trigger the existing fixed pipeline.
 ### Current design
 
 Pipeline operations live in `app.services.paper_pipeline`, independently of the
-FastAPI route handlers. The current UI still uses convenience operations that
-run the established sequence. Separate parsing, extraction, and question
-functions can also be called directly, so an orchestrator can reuse available
-context and skip work that is already complete.
+FastAPI route handlers. The current UI prepares papers through its existing
+ingestion/parsing flow. The agent toolset reads that prepared context, extracts
+fields only when needed, proposes and critiques questions, then saves the final
+question list.
 
 LangChain adapters live in `app.services.agent_tools`. Install them with
 `pip install -e ".[agent,gemini,openreview]"`. The pure tools are exported in
 `PAPER_TOOLS`; `create_paper_tools(session_factory)` combines them with the
-database-backed ingestion and save operations without exposing a session or
+database-backed lookup and final-save operations without exposing a session or
 database credentials as model arguments. Each adapter has a descriptive tool
 name and description, an explicit Pydantic input schema, and a Pydantic return
 type for its output schema; `PAPER_TOOL_OUTPUT_SCHEMAS` exposes those output
@@ -279,39 +258,74 @@ no agent or graph is created here.
 
 | Tool/service | Input | Output | Side effects |
 | --- | --- | --- | --- |
-| `ingest_forum(db, forum_id)` | Session and OpenReview forum ID | `PaperDetail` | Fetches and stores paper, revisions, reviews, parsed sections, extracted fields, and chunks. This convenience operation runs the current full ingestion pipeline. |
-| `ingest_upload(db, filename, data)` | Session, optional filename, PDF bytes | `PaperDetail` | Extracts and optionally matches the upload, then stores paper/version data and current pipeline outputs. |
-| `parse_paper_text(full_text, abstract="")` | Readable paper text and optional abstract fallback | Ordered `PaperTextSection` list | None; deterministic parsing. |
-| `extract_paper_fields(title, sections)` | Title and parsed sections | `SectionExtractedField` list with source positions | Gemini calls; no database writes. |
-| `generate_questions_from_context(...)` | Explicit title, abstract, extracted fields, count, optional full text | `QuestionGeneration` | Gemini call; no database writes. Reuse this when the agent already has suitable extracted fields. |
-| `propose_questions(...)` | Explicit paper context and count | `QuestionGeneration` proposals with focus and rationale | Gemini call; no database writes. |
-| `critique_question(...)` | Candidate question and paper context | `QuestionCritique` verdict, rubric scores, strengths/issues, optional revision | Gemini call; no database writes. |
-| `generate_and_store_questions(db, paper_id, count)` | Session, stored paper ID, count | `QuestionGenerationResponse` | Reads the latest stored version and saves draft questions linked to it. |
+| `get_stored_paper(db, paper_id)` | Session and prepared paper UUID | `PaperDetail` with latest text, sections, and existing extracted fields | Read-only database lookup. |
+| `get_all_reviews_for_paper(db, paper_id)` | Session and prepared paper UUID | All stored reviews tagged with version key, source forum, and paper title | Read-only lookup across every stored version, not only the latest. |
+| `retrieve_similar_example_questions(db, paper_context, k)` | Session, target paper abstract/claims, and result count | `SimilarExampleQuestions` paper/question pairs with source and similarity | Embeds target paper context and searches `example_pairs.paper_embedding`; read-only. |
+| `extract_paper_fields(title, full_text, abstract="")` | Title, full text, optional abstract fallback | Section-level fields and merged values | Parses sections internally, calls Gemini; no database writes. |
+| `propose_questions(...)` | Paper context, all-version reviews, similar-paper examples, and count | `QuestionGeneration` proposals with focus and rationale | Gemini call; no database writes. |
+| `critique_question(...)` | Candidate question, paper context, and all-version review context | `QuestionCritique` verdict, rubric scores, strengths/issues, optional revision | Gemini call; no database writes. |
+| `save_final_questions(db, paper_id, questions)` | Session, paper UUID, final questions paired with critique results | `QuestionGenerationResponse` | Saves questions with `keep` verdicts as final, linked to the latest paper version; stores focus, rationale, and critique details. |
+
+### Agent tool groups
+
+- **Context:** `get_stored_paper` reads the prepared paper, and
+  `get_all_reviews_for_paper` gathers its reviews across every stored version,
+  tagged with version and forum provenance. Call the review lookup for each run.
+  Check stored extracted fields before calling `extract_paper_fields`; extraction
+  calls Gemini but does not write to the database. Its result includes merged
+  values ready for `propose_questions`.
+- **Example retrieval:** `retrieve_similar_example_questions` embeds the target
+  paper's abstract and available claims, then searches the source-paper vectors
+  in `example_pairs`. It returns top matches as paper/question pairs; pass these
+  to `propose_questions` as few-shot examples. Similarity is based on the source
+  papers, not question text alone.
+- **Generation loop:** `propose_questions` creates candidates and
+  `critique_question` evaluates each one. Both receive the all-version review
+  context to avoid duplicate reviewer comments and surface unresolved concerns.
+  Proposals also receive the retrieved paper/question pairs as guidance. The
+  agent retains the latest critique alongside any revised question.
+- **Terminal:** `save_final_questions` persists only finished questions whose
+  latest critique verdict is `keep`.
+- **Preparation kept outside the agent:** `ingest_forum`, `ingest_upload`, and
+  `parse_paper_text` remain part of the UI's prepare-paper path and are not in
+  the agent toolset. A future version can add ingestion tools if handling an
+  under-prepared paper becomes an agent responsibility.
 
 `propose_questions` and `critique_question` are standalone functions in
 `app.services.gemini`, with validated Pydantic output models. The proposal
 operation returns question/focus/rationale records. The critique operation
 assesses specificity, grounding, answerability, and critical value, and returns
-a keep/revise/reject decision.
+a keep/revise/reject decision. The non-agentic application fallback remains
+available through the `generate_questions_from_context` and
+`generate_and_store_questions` services and the existing question-generation
+route; neither is exported as an agent tool, avoiding overlapping generation
+choices in the agent tool list.
 
 ### Intended agent decisions
 
 The orchestration should make choices from the context it receives for each
 paper rather than assuming every operation must run:
 
-1. Start from a stored paper or an uploaded/OpenReview source, depending on what
-   the user supplied. The application can pass the paper ID and existing paper
-   context into the agent.
-2. Reuse extracted fields when they are present and adequate. Parse and extract
-   only when needed; call `generate_questions_from_context` or `propose_questions`
-   directly when enough context is already available.
-3. Critique proposed questions and revise only the ones that need work, with a
-   bounded retry count and the critique attached to each candidate.
-4. Add retrieval of related work or reviewer critiques when that capability is
+1. The user starts the agentic run from the UI after preparing a paper. The
+   agent calls `get_stored_paper` and `get_all_reviews_for_paper` to gather the
+   latest paper context and reviews from all retained versions.
+2. Reuse adequate extracted fields. If they are absent or insufficient, call
+   `extract_paper_fields`. Pass its merged values and the aggregated review
+   context to `propose_questions`.
+3. Call `retrieve_similar_example_questions` with the paper's abstract and
+   available claims. Pass the returned pairs as few-shot examples to
+   `propose_questions`; the source-paper text, not question-only similarity,
+   determines which examples are selected.
+4. Critique proposed questions with the same review context to check for
+   duplicated reviewer comments and unresolved concerns. Revise only the ones
+   that need work, with a bounded retry count and the latest critique attached
+   to each candidate.
+5. Add retrieval of related work or reviewer critiques when that capability is
    available and useful for the paper.
-5. Return the generated results to the UI and persist them through the existing
-   save behavior where appropriate. Starting the workflow is an explicit UI
-   action; a human approval checkpoint is not part of the planned agent loop.
+6. When the loop is complete, call `save_final_questions` once with the final
+   questions and their keep critiques. Return the saved results to the UI.
+   Starting the workflow is an explicit UI action; a human approval checkpoint
+   is not part of the planned agent loop.
 
 ### Extending the workflow
 
@@ -323,8 +337,9 @@ the information an orchestrator needs to choose the next step:
   description that says when it is useful, and a clear statement of database or
   external-service side effects.
 - Keep orchestration state separate from tool code. Carry the paper and version
-  IDs, source provenance, existing extracted fields, candidate questions,
-  critique results, and retry count between graph steps.
+  IDs, source provenance, existing extracted fields, all-version review context,
+  retrieved paper/question pairs, candidate questions, critique results,
+  per-question revision counts, and the run-wide tool-call count between graph steps.
 - Keep context-dependent decisions in the graph. A tool should perform its
   named operation and return structured results rather than silently launching
   the rest of the pipeline.
@@ -332,6 +347,26 @@ the information an orchestrator needs to choose the next step:
   capabilities so future workflows can opt into them per paper.
 - Version prompts and keep proposal/critique outputs structured so workflow
   changes can be compared with evaluation data.
+- Enforce stopping limits in graph state as well as in the system prompt: at
+  most two revisions (three critique calls) per question and at most 40 tool
+  calls per run, including the final save. Reserve a tool call for
+  `save_final_questions` once any candidates are ready.
+
+`app.services.agent_policy` defines these limits and a prompt builder that
+states the run goal, when to reuse or extract context, the revision policy, and
+the terminal save conditions. The workflow graph should maintain the counters
+and enforce the same limits rather than relying on the prompt alone.
+
+The `example_pairs` table stores each example question with its source paper's
+title and representative abstract/claims, a 768-dimensional paper embedding,
+optional rationale, and source type (`own_criticism` or `openreview_review`).
+`retrieve_similar_example_questions` embeds the current paper's abstract and
+available claims with the configured Gemini embedding model, then ranks stored
+examples by cosine similarity between paper embeddings. It returns the source
+paper and its paired question together; question text is not used as the search
+vector. Populate `paper_embedding` with the same embedding model named in
+`embedding_model` for each row. Retrieval filters to the configured model and
+returns an empty list until matching examples are stored.
 
 ### Incremental development
 
@@ -339,15 +374,13 @@ The agentic workflow is expected to change as design work surfaces useful new
 roles for the agents. Start with a UI action that launches the workflow for a
 selected paper, then add capabilities in small steps without treating the
 initial sequence as a permanent graph. Potential additions include retrieval of
-related work or reviews, citation lookup, and other paper-analysis tools. Keep
-fine-tuning as a separate future project step. Workflow execution will not
-require human approval or collection of user edits.
+related work or reviews, citation lookup, and other paper-analysis tools.
+Workflow execution will not require human approval or collection of user edits.
 
-The current ingestion convenience tools still run parsing and extraction as
-part of the existing UI-compatible pipeline. If a future agent needs ingestion
-without those stages, add a source-only ingestion operation and compose parsing
-and extraction explicitly; keep the existing UI path as a composition of the
-same services.
+The current UI ingestion convenience operations still run parsing and
+extraction as part of the existing prepare-paper flow. If a future agent needs
+to handle an under-prepared paper, add a source-only ingestion operation and
+compose parsing and extraction explicitly; keep the UI path as it is today.
 
 ## Usage
 
@@ -461,7 +494,4 @@ Alternatively, pass an ID for a one-off fetch:
 .\.venv\Scripts\python.exe scripts\smoke_external_apis.py --forum-id <public-forum-id>
 ```
 ## License
-Code in this repository is licensed under MIT see([LICENSE](LICENSE)). This covers the codebase only:
-
-- Model weights: any fine-tuned LoRA adapters are derivatives of their base model and remain subject to that base model's license/acceptable-use terms, not MIT.
-- Data: OpenReview-derived data is not redistributed in bulk from this repo; see the Dataset section above.
+Code in this repository is licensed under MIT (see [LICENSE](LICENSE)). OpenReview-derived source data is not redistributed in bulk from this repository; raw review text is retained locally for processing only.

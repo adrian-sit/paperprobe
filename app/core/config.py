@@ -16,6 +16,7 @@ class Settings(BaseSettings):
 
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-2.5-flash"
+    gemini_embedding_model: str = "gemini-embedding-001"
 
     postgres_dsn: str | None = None
     mongodb_uri: str | None = None

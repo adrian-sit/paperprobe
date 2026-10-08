@@ -55,3 +55,11 @@ class QuestionCritique(BaseModel):
         default=None,
         description="A grounded revision when verdict is revise; otherwise null.",
     )
+
+
+class FinalAgentQuestion(GeneratedQuestion):
+    """A final proposed question paired with the critique that cleared it for saving."""
+
+    critique: QuestionCritique = Field(
+        description="The critique result for the final question; saving requires verdict=keep."
+    )

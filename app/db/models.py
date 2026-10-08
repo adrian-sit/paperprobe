@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func, text
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -153,6 +153,29 @@ class PaperChunk(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     paper_version: Mapped[PaperVersion] = relationship(back_populates="chunks")
+
+
+class ExamplePair(Base):
+    """A question example paired with the paper context it was written for."""
+
+    __tablename__ = "example_pairs"
+    __table_args__ = (
+        CheckConstraint(
+            "source_type IN ('own_criticism', 'openreview_review')",
+            name="ck_example_pairs_source_type",
+        ),
+        Index("ix_example_pairs_source_type", "source_type"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    source_title: Mapped[str] = mapped_column(Text)
+    source_abstract_or_claims: Mapped[str] = mapped_column(Text)
+    paper_embedding: Mapped[list[float]] = mapped_column(Vector(768))
+    question_text: Mapped[str] = mapped_column(Text)
+    rationale: Mapped[str | None] = mapped_column(Text)
+    source_type: Mapped[str] = mapped_column(String(32))
+    embedding_model: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class Question(Base):

@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 from dataclasses import replace
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -12,10 +13,10 @@ from sqlalchemy.orm import selectinload
 from app.core.config import get_settings
 from app.db.models import ExtractedField, Paper, PaperChunk, PaperSection, PaperVersion, Question, Review
 from app.schemas.papers import (
-    PaperDetail, PaperVersionSummary, QuestionGenerationResponse,
+    PaperDetail, PaperReviewContext, PaperReviewContextResponse, PaperVersionSummary, QuestionGenerationResponse,
     StoredExtractedField, StoredQuestion, StoredReview, StoredSection,
 )
-from app.schemas.extraction import QuestionGeneration
+from app.schemas.extraction import FinalAgentQuestion, QuestionGeneration
 from app.services.gemini import SectionExtractedField, extract_section_fields, generate_questions
 from app.services.openreview import OpenReviewPaper, fetch_paper, find_matching_forum
 from app.services.pdf import extract_title_and_abstract
@@ -149,6 +150,61 @@ def _serialize(paper: Paper, *, from_cache: bool = False, refreshed: bool = Fals
         from_cache=from_cache,
         refreshed=refreshed,
     )
+
+
+async def get_stored_paper(db: AsyncSession, paper_id: UUID) -> PaperDetail:
+    """Return the stored paper and latest-version context without modifying it."""
+    paper = await _load(db, paper_id)
+    if not paper:
+        raise ValueError("Paper not found.")
+    return _serialize(paper)
+
+
+async def get_all_reviews_for_paper(
+    db: AsyncSession, paper_id: UUID
+) -> PaperReviewContextResponse:
+    """Return reviews from every stored version of a paper with version/forum provenance."""
+    paper = await db.get(Paper, paper_id)
+    if paper is None:
+        raise ValueError("Paper not found.")
+
+    rows = (await db.execute(
+        select(Review, PaperVersion)
+        .join(PaperVersion, Review.paper_version_id == PaperVersion.id)
+        .where(PaperVersion.paper_id == paper_id)
+        .order_by(PaperVersion.version_timestamp, Review.written_at, Review.id)
+    )).all()
+    return PaperReviewContextResponse(
+        paper_id=paper_id,
+        reviews=[PaperReviewContext(
+            id=review.id,
+            paper_version_id=version.id,
+            version_key=version.version_key,
+            source_forum_id=version.source_forum_id,
+            paper_title=version.title,
+            openreview_note_id=review.openreview_note_id,
+            review_text=review.review_text,
+            invitation=review.invitation,
+            written_at=review.written_at,
+        ) for review, version in rows],
+    )
+
+
+def merge_section_extractions(fields: list[SectionExtractedField]) -> dict[str, dict]:
+    """Normalize section extraction records into the map accepted by question tools."""
+    merged: dict[str, dict] = {}
+    for field in fields:
+        if field.field_type == "summary":
+            target = merged.setdefault("summary", {"text": ""})
+            if not target["text"]:
+                target["text"] = field.value or ""
+            continue
+
+        target = merged.setdefault(field.field_type, {"items": []})["items"]
+        for item in field.value or []:
+            if item not in target:
+                target.append(item)
+    return merged
 
 
 async def _store(
@@ -471,6 +527,61 @@ async def generate_and_store_questions(db: AsyncSession, paper_id: UUID, count: 
     if report:
         await report("save", "Save questions", "success", "Questions saved.")
     return QuestionGenerationResponse(paper_id=paper.id, questions=[_question(q) for q in questions])
+
+
+async def save_final_questions(
+    db: AsyncSession, paper_id: UUID, questions: list[FinalAgentQuestion]
+) -> QuestionGenerationResponse:
+    """Persist agent-final questions without generating or revising their text.
+
+    Each candidate must carry a critique with a ``keep`` verdict. Critique
+    details, focus, and rationale are stored in ``critic_notes`` as JSON text.
+    Saved records are linked to the paper's latest version and marked final.
+    """
+    if not questions:
+        raise ValueError("At least one final question is required.")
+    if len(questions) > 10:
+        raise ValueError("No more than 10 final questions can be saved at once.")
+    if any(not item.question.strip() for item in questions):
+        raise ValueError("Final question text cannot be empty.")
+    if any(item.critique.verdict != "keep" for item in questions):
+        raise ValueError("Only questions with a keep critique verdict can be saved as final.")
+
+    paper = await _load(db, paper_id)
+    if not paper:
+        raise ValueError("Paper not found.")
+    version = _latest(paper)
+    if not version:
+        raise ValueError("Paper has no version to link final questions to.")
+
+    stored_questions: list[Question] = []
+    for item in questions:
+        critic_notes = json.dumps(
+            {
+                "focus": item.focus,
+                "rationale": item.rationale,
+                "critique": item.critique.model_dump(mode="json"),
+            },
+            ensure_ascii=False,
+        )
+        question = Question(
+            paper_id=paper.id,
+            paper_version_id=version.id,
+            text=item.question,
+            status="final",
+            source="agent",
+            critic_notes=critic_notes,
+        )
+        db.add(question)
+        stored_questions.append(question)
+
+    await db.commit()
+    for question in stored_questions:
+        await db.refresh(question)
+    return QuestionGenerationResponse(
+        paper_id=paper.id,
+        questions=[_question(question) for question in stored_questions],
+    )
 
 
 

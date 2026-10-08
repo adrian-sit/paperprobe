@@ -47,6 +47,27 @@ class StoredReview(BaseModel):
     written_at: datetime | None
 
 
+class PaperReviewContext(BaseModel):
+    """A review annotated with the paper revision and forum it refers to."""
+
+    id: UUID
+    paper_version_id: UUID
+    version_key: str
+    source_forum_id: str | None = None
+    paper_title: str | None = None
+    openreview_note_id: str
+    review_text: str
+    invitation: str | None = None
+    written_at: datetime | None = None
+
+
+class PaperReviewContextResponse(BaseModel):
+    """All stored reviews for a paper, across every retained version."""
+
+    paper_id: UUID
+    reviews: list[PaperReviewContext]
+
+
 class PaperVersionDetail(BaseModel):
     id: UUID
     paper_id: UUID
