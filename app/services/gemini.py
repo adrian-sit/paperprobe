@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.core.config import get_settings
-from app.schemas.extraction import Claim, QuestionGeneration
+from app.schemas.extraction import Claim, QuestionCritique, QuestionGeneration
 from app.services.paper_sections import PaperTextSection, section_field_groups
 
 
@@ -123,3 +123,98 @@ def generate_questions(
     if len(result.questions) != count:
         raise RuntimeError(f"Gemini returned {len(result.questions)} questions; expected {count}.")
     return result
+
+
+def propose_questions(
+    title: str,
+    abstract: str,
+    extracted_fields: dict[str, dict],
+    count: int = 5,
+    paper_text: str = "",
+) -> QuestionGeneration:
+    """Propose grounded peer-review questions from supplied paper evidence."""
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError as exc:
+        raise RuntimeError('Gemini client is missing. Install with: pip install -e ".[gemini]"') from exc
+
+    if not 1 <= count <= 10:
+        raise ValueError("Question count must be between 1 and 10.")
+    settings = get_settings()
+    if not settings.gemini_api_key:
+        raise RuntimeError("GEMINI_API_KEY is required for question proposal.")
+
+    context = {"title": title, "abstract": abstract, "extracted_fields": extracted_fields}
+    if paper_text.strip():
+        context["paper_text"] = paper_text
+    response = genai.Client(api_key=settings.gemini_api_key).models.generate_content(
+        model=settings.gemini_model,
+        contents=(
+            f"Propose exactly {count} distinct questions for a peer-review discussion. "
+            "Prefer questions that probe evidence, assumptions, methodology, scope, or limitations. "
+            "Each question must be specific, answerable, and supported by the supplied paper context. "
+            "Do not ask for facts already answered plainly in the context. Do not invent claims or "
+            "cite outside work. Give each question a short focus and explain why it is useful.\n\n"
+            f"Paper context:\n{context}"
+        ),
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=QuestionGeneration,
+            temperature=0.3,
+        ),
+    )
+    if not response.text:
+        raise RuntimeError("Gemini returned no question proposals.")
+    result = QuestionGeneration.model_validate_json(response.text)
+    if len(result.questions) != count:
+        raise RuntimeError(f"Gemini returned {len(result.questions)} proposals; expected {count}.")
+    return result
+
+
+def critique_question(
+    question: str,
+    title: str,
+    abstract: str = "",
+    extracted_fields: dict[str, dict] | None = None,
+    paper_text: str = "",
+) -> QuestionCritique:
+    """Assess a candidate question for grounding, answerability, specificity, and value."""
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError as exc:
+        raise RuntimeError('Gemini client is missing. Install with: pip install -e ".[gemini]"') from exc
+
+    settings = get_settings()
+    if not settings.gemini_api_key:
+        raise RuntimeError("GEMINI_API_KEY is required for question critique.")
+
+    context = {
+        "title": title,
+        "abstract": abstract,
+        "extracted_fields": extracted_fields or {},
+    }
+    if paper_text.strip():
+        context["paper_text"] = paper_text
+    response = genai.Client(api_key=settings.gemini_api_key).models.generate_content(
+        model=settings.gemini_model,
+        contents=(
+            "Critique the candidate question only against the supplied paper context. Score each "
+            "dimension from 1 (poor) to 5 (strong). Grounding means the question does not assume "
+            "unsupported facts. Answerability means the authors could respond using their work. "
+            "Critical value means the answer could clarify evidence, assumptions, limitations, or "
+            "implications. Use keep only when it is already strong, revise when a specific grounded "
+            "improvement is possible, and reject when it is ungrounded, unanswerable, or low-value. "
+            "Do not reward generic wording. Provide a revised question only for revise.\n\n"
+            f"Paper context:\n{context}\n\nCandidate question:\n{question}"
+        ),
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=QuestionCritique,
+            temperature=0,
+        ),
+    )
+    if not response.text:
+        raise RuntimeError("Gemini returned no question critique.")
+    return QuestionCritique.model_validate_json(response.text)

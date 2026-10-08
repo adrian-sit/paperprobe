@@ -39,7 +39,7 @@ I took an LLM-paper seminar class, and whenever I tried to ask an LLM to think o
 - Retrieval of related papers and reviewer critiques
 
 ### Agentic Workflow
-The core pipeline isn't a single prompt, it's a small sequence of steps where the LLM's output at one step decides what happens next. Planned steps, roughly in build order:
+The agentic workflow will let the model choose which paper operations to call and how to use their results. Its current service/tool boundary and the intended evolution are described in [Agentic workflow](#agentic-workflow).
 
 1. Extract → Generate → Critique loop: extract the paper's claims/methods, generate discussion questions from them, then have a second pass judge each question (too vague? already answered in the paper? not actually critical?) and send weak ones back to be rewritten, up to a couple of tries.
 2. Look-up step before generating: before writing questions, the pipeline can search for related papers or past reviewer comments on similar work, so questions can reference relevant context instead of only the paper's own text.
@@ -169,29 +169,6 @@ snapshot; PostgreSQL is the queryable application model.
 
 ## Current data pipeline
 
-### Service boundary for future orchestration
-
-Pipeline operations are available as independent Python services so a future
-agent can choose which operation a paper needs. This refactor does not add an
-agent or change the UI's current sequence. The service contracts are:
-
-| Operation | Input | Output | Side effects |
-| --- | --- | --- | --- |
-| `ingest_forum(db, forum_id, report=None)` | Async SQLAlchemy session, OpenReview forum ID, optional progress callback | `PaperDetail` | Fetches and refreshes the paper, reviews, sections, extracted fields, and chunks; commits to PostgreSQL and archives raw OpenReview data through the existing connector. |
-| `ingest_upload(db, filename, data, report=None)` | Async session, optional filename, PDF bytes, optional progress callback | `PaperDetail` | Extracts and optionally matches the upload, then stores its paper/version data and current pipeline outputs. |
-| `parse_paper_text(full_text, abstract="")` | Readable paper text and optional abstract fallback | Ordered `PaperTextSection` list | None; deterministic parsing only. |
-| `extract_paper_fields(title, sections)` | Paper title and parsed sections | `SectionExtractedField` list, each with field type, value, and source section position | Gemini calls; no database writes. |
-| `generate_questions_from_context(title, abstract, extracted_fields, count, paper_text="")` | Explicit paper context and requested count | Validated `QuestionGeneration` result | Gemini call; no database writes. |
-| `generate_and_store_questions(db, paper_id, count, report=None)` | Async session, stored paper ID, requested count, optional progress callback | `QuestionGenerationResponse` | Reads the latest stored version and extracted fields, then saves draft questions linked to that version. |
-
-Callers that already have suitable extracted fields can call
-`generate_questions_from_context` directly and skip parsing or extraction. The
-database-backed ingestion and question operations remain available for the UI;
-the pure parsing, extraction, and generation operations can be composed with
-other callers without going through a FastAPI handler. Progress reporting is an
-optional callback on the database-backed operations, so HTTP-specific progress
-streaming stays in the API layer.
-
 1. **Receive and identify the paper.** A user can submit a forum ID directly or
    upload a PDF. Upload processing extracts title, likely authors, abstract,
    and complete machine-readable PDF text. When title or abstract layout
@@ -281,6 +258,92 @@ that need OCR are not currently recognized. MongoDB preserves source-shaped
 OpenReview JSON for future extraction, while PostgreSQL stores one latest version
 per matched forum with its version-linked text, review records, structured fields,
 and retrieval chunks.
+
+## Agentic workflow
+
+This section records the current boundary between the application and future
+agent orchestration. The agent itself is not implemented yet; the current UI
+continues to trigger the existing fixed pipeline.
+
+### Current design
+
+Pipeline operations live in `app.services.paper_pipeline`, independently of the
+FastAPI route handlers. The current UI still uses convenience operations that
+run the established sequence. Separate parsing, extraction, and question
+functions can also be called directly, so an orchestrator can reuse available
+context and skip work that is already complete.
+
+LangChain adapters live in `app.services.agent_tools`. Install them with
+`pip install -e ".[agent,gemini,openreview]"`. The pure tools are exported in
+`PAPER_TOOLS`; `create_paper_tools(session_factory)` combines them with the
+database-backed ingestion and save operations without exposing a session or
+database credentials as model arguments. Each adapter has a descriptive tool
+name and description, an explicit Pydantic input schema, and a Pydantic return
+type for its output schema; `PAPER_TOOL_OUTPUT_SCHEMAS` exposes those output
+models by tool name. The tools can be passed directly to LangChain or LangGraph;
+no agent or graph is created here.
+
+| Tool/service | Input | Output | Side effects |
+| --- | --- | --- | --- |
+| `ingest_forum(db, forum_id)` | Session and OpenReview forum ID | `PaperDetail` | Fetches and stores paper, revisions, reviews, parsed sections, extracted fields, and chunks. This convenience operation runs the current full ingestion pipeline. |
+| `ingest_upload(db, filename, data)` | Session, optional filename, PDF bytes | `PaperDetail` | Extracts and optionally matches the upload, then stores paper/version data and current pipeline outputs. |
+| `parse_paper_text(full_text, abstract="")` | Readable paper text and optional abstract fallback | Ordered `PaperTextSection` list | None; deterministic parsing. |
+| `extract_paper_fields(title, sections)` | Title and parsed sections | `SectionExtractedField` list with source positions | Gemini calls; no database writes. |
+| `generate_questions_from_context(...)` | Explicit title, abstract, extracted fields, count, optional full text | `QuestionGeneration` | Gemini call; no database writes. Reuse this when the agent already has suitable extracted fields. |
+| `propose_questions(...)` | Explicit paper context and count | `QuestionGeneration` proposals with focus and rationale | Gemini call; no database writes. |
+| `critique_question(...)` | Candidate question and paper context | `QuestionCritique` verdict, rubric scores, strengths/issues, optional revision | Gemini call; no database writes. |
+| `generate_and_store_questions(db, paper_id, count)` | Session, stored paper ID, count | `QuestionGenerationResponse` | Reads the latest stored version and saves draft questions linked to it. |
+
+`propose_questions` and `critique_question` are standalone functions in
+`app.services.gemini`, with validated Pydantic output models. The proposal
+operation returns question/focus/rationale records. The critique operation
+assesses specificity, grounding, answerability, and critical value, and returns
+a keep/revise/reject decision.
+
+### Intended agent decisions
+
+The orchestration should make choices from the context it receives for each
+paper rather than assuming every operation must run:
+
+1. Start from a stored paper or an uploaded/OpenReview source, depending on what
+   the user supplied. The application can pass the paper ID and existing paper
+   context into the agent.
+2. Reuse extracted fields when they are present and adequate. Parse and extract
+   only when needed; call `generate_questions_from_context` or `propose_questions`
+   directly when enough context is already available.
+3. Critique proposed questions and revise only the ones that need work, with a
+   bounded retry count and the critique attached to each candidate.
+4. Add retrieval of related work or reviewer critiques when that capability is
+   available and useful for the paper.
+5. Present drafts for human approval before finalizing them. The current save
+   operation stores questions as drafts; approval and edit handling remain future
+   workflow work.
+
+### Extending the workflow
+
+Future orchestration should own ordering, branching, retries, and human
+checkpoints. Individual tools should stay focused on one operation and expose
+the information an orchestrator needs to choose the next step:
+
+- Give each new tool an explicit Pydantic input and output model, a concise
+  description that says when it is useful, and a clear statement of database or
+  external-service side effects.
+- Keep orchestration state separate from tool code. Carry the paper and version
+  IDs, source provenance, existing extracted fields, candidate questions,
+  critique results, retry count, and approval status between graph steps.
+- Keep context-dependent decisions in the graph. A tool should perform its
+  named operation and return structured results rather than silently launching
+  the rest of the pipeline.
+- Add retrieval, model alternatives, or additional reviewer tools as separate
+  capabilities so future workflows can opt into them per paper.
+- Version prompts and keep proposal/critique outputs structured so workflow
+  changes can be compared with evaluation data and human edits.
+
+The current ingestion convenience tools still run parsing and extraction as
+part of the existing UI-compatible pipeline. If a future agent needs ingestion
+without those stages, add a source-only ingestion operation and compose parsing
+and extraction explicitly; keep the existing UI path as a composition of the
+same services.
 
 ## Usage
 
