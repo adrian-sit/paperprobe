@@ -39,7 +39,7 @@ I took an LLM-paper seminar class, and whenever I tried to ask an LLM to think o
 - Retrieval of related papers and reviewer critiques
 
 ### Agentic Workflow
-The agentic workflow will be an option launched from the existing UI for a selected paper, alongside the current application flow. The agent will choose which available paper operations to use, reuse suitable stored fields, and generate and critique questions. The workflow will grow incrementally as design adds more useful agent capabilities; the current design and extension points are described in [Agentic workflow](#agentic-workflow).
+The agentic workflow will be an option launched from the existing UI for a selected paper, alongside the current application flow. The agent will choose which available paper operations to use, reuse suitable stored fields, and generate and critique questions. The workflow will grow incrementally as design adds more useful agent capabilities; the current design and extension points are described in [Agentic workflow design](#agentic-workflow-design).
 
 ### Models and evaluation
 - Future direction: LoRA / QLoRA fine-tuning on filtered reviewer questions
@@ -253,7 +253,7 @@ OpenReview JSON for future extraction, while PostgreSQL stores one latest versio
 per matched forum with its version-linked text, review records, structured fields,
 and retrieval chunks.
 
-## Agentic workflow
+## Agentic workflow design
 
 This section records the current boundary between the application and future
 agent orchestration. The agent itself is not implemented yet; the current UI
