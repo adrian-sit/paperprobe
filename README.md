@@ -93,7 +93,8 @@ Early, high-level thinking on the first two pieces of the pipeline. Details (sch
 
 ```
 app/
-  api/routes/       # HTTP endpoints
+  api/routes/       # HTTP endpoints and HTTP-specific error mapping
+  services/         # reusable ingestion, parsing, extraction, and generation operations
   core/config.py    # environment-based settings
   schemas/          # validated API request/response models
   main.py           # FastAPI application factory
@@ -103,6 +104,8 @@ tests/              # API tests
 
 The API supports health/readiness checks, OpenReview ingestion, direct PDF upload,
 paper retrieval, and question generation. Ingestion runs synchronously for now.
+Routes delegate pipeline work to `app.services.paper_pipeline`; the current UI and
+HTTP behavior still run the same end-to-end sequence.
 
 ## Setup
 
@@ -165,6 +168,29 @@ version_id)` to read the preserved source records. MongoDB is the raw source
 snapshot; PostgreSQL is the queryable application model.
 
 ## Current data pipeline
+
+### Service boundary for future orchestration
+
+Pipeline operations are available as independent Python services so a future
+agent can choose which operation a paper needs. This refactor does not add an
+agent or change the UI's current sequence. The service contracts are:
+
+| Operation | Input | Output | Side effects |
+| --- | --- | --- | --- |
+| `ingest_forum(db, forum_id, report=None)` | Async SQLAlchemy session, OpenReview forum ID, optional progress callback | `PaperDetail` | Fetches and refreshes the paper, reviews, sections, extracted fields, and chunks; commits to PostgreSQL and archives raw OpenReview data through the existing connector. |
+| `ingest_upload(db, filename, data, report=None)` | Async session, optional filename, PDF bytes, optional progress callback | `PaperDetail` | Extracts and optionally matches the upload, then stores its paper/version data and current pipeline outputs. |
+| `parse_paper_text(full_text, abstract="")` | Readable paper text and optional abstract fallback | Ordered `PaperTextSection` list | None; deterministic parsing only. |
+| `extract_paper_fields(title, sections)` | Paper title and parsed sections | `SectionExtractedField` list, each with field type, value, and source section position | Gemini calls; no database writes. |
+| `generate_questions_from_context(title, abstract, extracted_fields, count, paper_text="")` | Explicit paper context and requested count | Validated `QuestionGeneration` result | Gemini call; no database writes. |
+| `generate_and_store_questions(db, paper_id, count, report=None)` | Async session, stored paper ID, requested count, optional progress callback | `QuestionGenerationResponse` | Reads the latest stored version and extracted fields, then saves draft questions linked to that version. |
+
+Callers that already have suitable extracted fields can call
+`generate_questions_from_context` directly and skip parsing or extraction. The
+database-backed ingestion and question operations remain available for the UI;
+the pure parsing, extraction, and generation operations can be composed with
+other callers without going through a FastAPI handler. Progress reporting is an
+optional callback on the database-backed operations, so HTTP-specific progress
+streaming stays in the API layer.
 
 1. **Receive and identify the paper.** A user can submit a forum ID directly or
    upload a PDF. Upload processing extracts title, likely authors, abstract,
