@@ -29,7 +29,7 @@ I took an LLM-paper seminar class, and whenever I tried to ask an LLM to think o
 ### Project Goals
 - Generate discussion questions that are specific, answerable, critical, and closely tied to the paper
 - Combine prompting, retrieval, fine-tuning, and agentic workflows into the strongest single pipeline
-- Close the loop: user feedback and edits become future training and evaluation data
+- Improve question quality through evaluation and iterative development; model fine-tuning remains a future direction
 
 ## Planned Features
 ### Core Pipeline
@@ -39,29 +39,23 @@ I took an LLM-paper seminar class, and whenever I tried to ask an LLM to think o
 - Retrieval of related papers and reviewer critiques
 
 ### Agentic Workflow
-The agentic workflow will let the model choose which paper operations to call and how to use their results. Its current service/tool boundary and the intended evolution are described in [Agentic workflow](#agentic-workflow).
-
-1. Extract → Generate → Critique loop: extract the paper's claims/methods, generate discussion questions from them, then have a second pass judge each question (too vague? already answered in the paper? not actually critical?) and send weak ones back to be rewritten, up to a couple of tries.
-2. Look-up step before generating: before writing questions, the pipeline can search for related papers or past reviewer comments on similar work, so questions can reference relevant context instead of only the paper's own text.
-3. Human check-in: the person using the app can approve, edit, or reject questions before they're finalized; those edits are saved and become future training data.
-4. (Later, optional) Tool using step for example pulling citation details, or other tasks to be added to the workflow
+The agentic workflow will be an option launched from the existing UI for a selected paper, alongside the current application flow. The agent will choose which available paper operations to use, reuse suitable stored fields, and generate and critique questions. The workflow will grow incrementally as design adds more useful agent capabilities; the current design and extension points are described in [Agentic workflow](#agentic-workflow).
 
 ### Models and evaluation
-- LoRA / QLoRA fine-tuning on filtered reviewer questions
-- Evaluation with embedding similarity, LLM-as-judge rubrics, and human ratings, used to guide iteration and catch regressions
+- Future direction: LoRA / QLoRA fine-tuning on filtered reviewer questions
+- Evaluation with embedding similarity, LLM-as-judge rubrics, and offline human ratings, used to guide iteration and catch regressions
 - Latency/throughput benchmarks for the serving setup
 
 ### Platform
 - FastAPI backend with async jobs and streaming responses
 - PostgreSQL (with vector search) plus a NoSQL store for raw and semi-structured data
-- Simple web UI for viewing papers, rating questions, and editing outputs
+- Extend the existing web UI with an action to start the agentic workflow for a selected paper
 - Tracing and observability for LLM calls and agent runs
   
 ## Dataset
 ### Planned sources:
 - OpenReview: papers, reviews, and discussion threads collected through the official API, used to build a question-generation dataset from reviewer comments
 - Personal annotations: my collected criticisms and questions on selected papers, as a small, high-quality set
-- User feedback (later): ratings and edits collected through the app
 
 ### Planned handling:
 - Filter reviewer questions for specificity and quality before fine-tuning
@@ -87,7 +81,7 @@ Early, high-level thinking on the first two pieces of the pipeline. Details (sch
 2. Retrieval and orchestration: vector search, first agentic workflow
 3. Fine-tuning: dataset construction and LoRA/QLoRA experiments
 4. Serving and evaluation: vLLM deployment, benchmarks, iteration based on evaluation results
-5. Integration: frontend, feedback loop, observability
+5. Integration: UI launch for agentic runs, observability
 
 ## Project Structure
 
@@ -315,14 +309,14 @@ paper rather than assuming every operation must run:
    bounded retry count and the critique attached to each candidate.
 4. Add retrieval of related work or reviewer critiques when that capability is
    available and useful for the paper.
-5. Present drafts for human approval before finalizing them. The current save
-   operation stores questions as drafts; approval and edit handling remain future
-   workflow work.
+5. Return the generated results to the UI and persist them through the existing
+   save behavior where appropriate. Starting the workflow is an explicit UI
+   action; a human approval checkpoint is not part of the planned agent loop.
 
 ### Extending the workflow
 
-Future orchestration should own ordering, branching, retries, and human
-checkpoints. Individual tools should stay focused on one operation and expose
+Future orchestration should own ordering, branching, and bounded retries.
+Individual tools should stay focused on one operation and expose
 the information an orchestrator needs to choose the next step:
 
 - Give each new tool an explicit Pydantic input and output model, a concise
@@ -330,14 +324,24 @@ the information an orchestrator needs to choose the next step:
   external-service side effects.
 - Keep orchestration state separate from tool code. Carry the paper and version
   IDs, source provenance, existing extracted fields, candidate questions,
-  critique results, retry count, and approval status between graph steps.
+  critique results, and retry count between graph steps.
 - Keep context-dependent decisions in the graph. A tool should perform its
   named operation and return structured results rather than silently launching
   the rest of the pipeline.
 - Add retrieval, model alternatives, or additional reviewer tools as separate
   capabilities so future workflows can opt into them per paper.
 - Version prompts and keep proposal/critique outputs structured so workflow
-  changes can be compared with evaluation data and human edits.
+  changes can be compared with evaluation data.
+
+### Incremental development
+
+The agentic workflow is expected to change as design work surfaces useful new
+roles for the agents. Start with a UI action that launches the workflow for a
+selected paper, then add capabilities in small steps without treating the
+initial sequence as a permanent graph. Potential additions include retrieval of
+related work or reviews, citation lookup, and other paper-analysis tools. Keep
+fine-tuning as a separate future project step. Workflow execution will not
+require human approval or collection of user edits.
 
 The current ingestion convenience tools still run parsing and extraction as
 part of the existing UI-compatible pipeline. If a future agent needs ingestion
