@@ -4,12 +4,19 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>PaperProbe</title>
-    <link rel="stylesheet" href="/static/styles.css?v=multi-forum-revision-1" />
+    <script>
+      const savedTheme = localStorage.getItem('paperprobe-theme');
+      document.documentElement.dataset.theme = savedTheme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+    </script>
+    <link rel="stylesheet" href="/static/styles.css?v=example-library-management-1" />
   </head>
   <body>
     <main class="shell">
       <header>
-        <p class="eyebrow">PAPERPROBE</p>
+        <div class="header-top">
+          <p class="eyebrow">PAPERPROBE</p>
+          <button id="theme-toggle" class="theme-toggle" type="button" aria-pressed="false" aria-label="Switch to dark mode">Dark mode</button>
+        </div>
         <h1>Read papers critically.</h1>
         <p class="lede">Start with an OpenReview forum ID or upload a paper. PaperProbe extracts its key details, then generates focused discussion questions.</p>
       </header>
@@ -40,6 +47,57 @@
             <strong id="detected-title"></strong>
           </div>
           <ol id="activity-log" aria-live="polite" aria-relevant="additions text"></ol>
+        </section>
+      </section>
+
+      <section class="panel example-library-panel" aria-labelledby="example-library-title">
+        <p class="eyebrow">AGENT EXAMPLES</p>
+        <h2 id="example-library-title">Add a paper and its questions</h2>
+        <p class="hint">Upload a source paper and save 1–20 questions written about it. PaperProbe stores each question with the source paper context so similar papers can retrieve relevant examples later.</p>
+        <form id="example-upload-form">
+          <div class="example-upload-fields">
+            <div>
+              <label for="example-paper-file">Source paper PDF</label>
+              <input id="example-paper-file" type="file" accept="application/pdf,.pdf" required />
+              <p class="hint">PDFs up to 20 MB. The detected abstract is used as the paper context; readable paper text is used when no abstract is found.</p>
+            </div>
+            <div>
+              <label for="example-source-type">Question source</label>
+              <select id="example-source-type" required>
+                <option value="own_criticism">My own criticism</option>
+                <option value="openreview_review">OpenReview review</option>
+              </select>
+            </div>
+          </div>
+          <div class="example-question-heading">
+            <h3>Questions for this paper</h3>
+            <button id="add-example-question" type="button" class="secondary-button">Add a question</button>
+          </div>
+          <div id="example-question-rows" class="example-question-rows">
+            <div class="example-question-row">
+              <div>
+                <label>Question</label>
+                <textarea class="example-question-text" required rows="3" placeholder="Enter a question grounded in this paper"></textarea>
+              </div>
+              <div>
+                <label>Rationale <span class="optional-label">optional</span></label>
+                <textarea class="example-question-rationale" rows="2" placeholder="Why is this a useful question?"></textarea>
+              </div>
+              <button type="button" class="remove-example-question" aria-label="Remove question" title="Remove question">×</button>
+            </div>
+          </div>
+          <div class="example-upload-actions">
+            <button id="save-example-pairs" type="submit">Save example questions</button>
+            <span id="example-upload-status" class="example-upload-status" role="status" aria-live="polite"></span>
+          </div>
+        </form>
+        <section class="saved-example-library" aria-labelledby="saved-example-library-title">
+          <div class="example-question-heading">
+            <h3 id="saved-example-library-title">Saved papers and questions</h3>
+            <button id="refresh-example-library" type="button" class="secondary-button">Refresh list</button>
+          </div>
+          <p id="saved-example-status" class="example-upload-status" role="status" aria-live="polite"></p>
+          <div id="saved-example-papers" class="saved-example-papers" aria-live="polite"></div>
         </section>
       </section>
 
@@ -91,6 +149,6 @@
         </section>
       </section>
     </main>
-    <script src="/static/app.js?v=multi-forum-revision-1"></script>
+    <script src="/static/app.js?v=example-library-management-1"></script>
   </body>
 </html>

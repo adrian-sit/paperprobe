@@ -168,6 +168,7 @@ class ExamplePair(Base):
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    source_paper_id: Mapped[uuid.UUID | None] = mapped_column(index=True)
     source_title: Mapped[str] = mapped_column(Text)
     source_abstract_or_claims: Mapped[str] = mapped_column(Text)
     paper_embedding: Mapped[list[float]] = mapped_column(Vector(768))

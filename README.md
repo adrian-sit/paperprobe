@@ -39,6 +39,14 @@ I took an LLM-paper seminar class, and whenever I asked an LLM to think of discu
 ### Agentic Workflow
 The agentic workflow will be an option launched from the existing UI for a selected paper, alongside the current application flow. The agent will choose which available paper operations to use, reuse suitable stored fields, and generate and critique questions. The workflow will grow incrementally as design adds more useful agent capabilities; the current design and extension points are described in [Agentic workflow design](#agentic-workflow-design).
 
+### Agent example library
+The UI has a separate example-library flow for uploading a source paper PDF and
+one or more associated questions, with an optional rationale for each question.
+Each question is stored as a paper-conditioned row in `example_pairs`; the paper
+context is embedded once and shared by that paper's question rows, which also
+share a `source_paper_id`. This flow does not create or modify a normal application
+paper record.
+
 ### Models and evaluation
 - Evaluation with embedding similarity, LLM-as-judge rubrics, and offline human ratings, used to guide iteration and catch regressions
 
@@ -365,7 +373,10 @@ available claims with the configured Gemini embedding model, then ranks stored
 examples by cosine similarity between paper embeddings. It returns the source
 paper and its paired question together; question text is not used as the search
 vector. Populate `paper_embedding` with the same embedding model named in
-`embedding_model` for each row. Retrieval filters to the configured model and
+`embedding_model` for each row. The separate example-library UI flow accepts a
+PDF and multiple questions, extracts the source title and abstract (or readable
+text when no abstract is found), embeds the source once, and stores one paired
+row per question. Retrieval filters to the configured embedding model and
 returns an empty list until matching examples are stored.
 
 ### Incremental development
@@ -416,6 +427,16 @@ After ingestion, use the revision selector to inspect each revision's source for
 title, authors, parsed sections, extracted fields, and reviews. Review text is expandable
 and the selected version key, timestamp, and review count stay visible in the UI.
 
+Use the separate **Add a paper and its questions** panel to add examples for
+future agent runs. Upload a PDF, choose whether its questions are your own
+criticism or from an OpenReview review, then add one or more question/rationale
+pairs. This saves the example pairs without adding the source PDF to the regular
+paper library. The **Saved papers and questions** list in the same panel lets you
+read each stored paper context and its questions, edit question text or rationale,
+remove individual questions, and add questions to a paper already in the library.
+These normal example-library changes can all be made in the UI; the database CLI
+remains available for broader inspection and administration.
+
 1. PaperProbe extracts the PDF title, abstract, and likely author names from the
    first-page author block, then checks PostgreSQL for the exact PDF (by SHA-256
    digest). The PDF abstract is retained for local processing but does not rank
@@ -456,6 +477,9 @@ was initially stored without its OpenReview match:
 .\.venv\Scripts\python.exe scripts\db_admin.py list
 .\.venv\Scripts\python.exe scripts\db_admin.py show <paper-id>
 .\.venv\Scripts\python.exe scripts\db_admin.py reconcile <paper-id>
+.\.venv\Scripts\python.exe scripts\db_admin.py examples list
+.\.venv\Scripts\python.exe scripts\db_admin.py examples show <source-paper-id>
+.\.venv\Scripts\python.exe scripts\db_admin.py rows example_pairs --limit 50
 ```
 
 `reconcile` uses the stored forum ID when present. Otherwise it searches by the
@@ -464,10 +488,20 @@ ambiguous. It asks for confirmation, then refreshes all versions and reviews.
 Existing questions are kept but marked `stale` because the latest paper context
 may have changed. Gemini must be configured for refreshed extraction.
 
-The CLI also supports `delete <paper-id>` and `reset`. Both require typing an
-explicit confirmation phrase. `show` reports revision keys, timestamps, text
-sizes, review counts, and chunk counts. Deletes cascade through all version-level
-records; reset preserves PostgreSQL itself and the Alembic schema.
+The CLI's `status` command counts every table registered in the application
+schema, including newly added tables. `rows <table>` inspects records from any
+mapped table (embedding values are summarized by dimension); pass `--record-id`
+to inspect one row. `delete-row <table> <record-id>` removes one row after an
+explicit confirmation and follows database cascade rules.
+
+Use `examples list [--query TEXT] [--source-type own_criticism|openreview_review]`
+to find uploaded source papers, `examples show <source-paper-id>` to inspect its
+paper context and all associated questions, and
+`examples delete <source-paper-id>` to remove that source and its question pairs. The CLI also
+supports `delete <paper-id>` and `reset`; destructive operations require typing
+an explicit confirmation phrase. Deleting a normal paper cascades through its
+version-level records. Reset clears every mapped PaperProbe table, including
+example pairs, while preserving PostgreSQL itself and the Alembic schema.
 
 Run the initial test suite with `pytest`.
 
