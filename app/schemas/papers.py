@@ -122,3 +122,14 @@ class StoredQuestion(BaseModel):
 class QuestionGenerationResponse(BaseModel):
     paper_id: UUID
     questions: list[StoredQuestion]
+
+
+class AgenticQuestionWorkflowResponse(BaseModel):
+    """Saved result and run summary for one structured agentic question workflow."""
+
+    paper_id: UUID
+    requested_count: int
+    saved_count: int
+    tool_calls: int
+    outcome: str
+    questions: list[StoredQuestion] = Field(default_factory=list)

@@ -20,14 +20,18 @@ def _embed_text(text: str, *, api_key: str, model: str, task_type: str) -> list[
     except ImportError as exc:
         raise RuntimeError('Gemini client is missing. Install with: pip install -e ".[gemini]"') from exc
 
-    response = genai.Client(api_key=api_key).models.embed_content(
-        model=model,
-        contents=text,
-        config=types.EmbedContentConfig(
-            task_type=task_type,
-            output_dimensionality=EMBEDDING_DIMENSIONS,
-        ),
-    )
+    client = genai.Client(api_key=api_key)
+    try:
+        response = client.models.embed_content(
+            model=model,
+            contents=text,
+            config=types.EmbedContentConfig(
+                task_type=task_type,
+                output_dimensionality=EMBEDDING_DIMENSIONS,
+            ),
+        )
+    finally:
+        client.close()
     if not response.embeddings or not response.embeddings[0].values:
         raise RuntimeError("Gemini returned no paper-context embedding.")
     vector = list(response.embeddings[0].values)

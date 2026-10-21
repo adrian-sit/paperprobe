@@ -10,11 +10,11 @@ The project has two purposes:
 1. Build a useful tool for critically reading research papers.
 2. Explore LLM application engineering across APIs, backends, databases, and orchestration.
 
-The application combines structured prompting and retrieval. Its existing UI flow remains available, with an agentic workflow planned as an additional way to work with a prepared paper.
+The application combines structured prompting, retrieval, and a LangGraph workflow. The existing question generator remains available alongside an agentic workflow that can be started for a prepared paper from the UI.
 
 ## Motivation
 
-I took an LLM-paper seminar class, and whenever I asked an LLM to think of discussion questions based on a paper, it often generated superficial or strange questions. In class, people asked insightful questions, and I learned a lot from seeing how they critiqued papers. I want to help readers develop similarly useful questions grounded in a paper's content. The planned agentic workflow will let the application choose which available analysis operations are useful for a particular paper.
+I took an LLM-paper seminar class, and whenever I asked an LLM to think of discussion questions based on a paper, it often generated superficial or strange questions. In class, people asked insightful questions, and I learned a lot from seeing how they critiqued papers. I want to help readers develop similarly useful questions grounded in a paper's content. The agentic workflow gathers available context, proposes questions, and uses model critiques to decide whether each candidate is ready, needs revision, or should be replaced.
 
 ## Goals
 ### Learning Goals
@@ -29,15 +29,15 @@ I took an LLM-paper seminar class, and whenever I asked an LLM to think of discu
 - Combine structured prompting, retrieval, and agentic workflows to support critical paper discussion
 - Improve question quality through evaluation and iterative development
 
-## Planned Features
+## Features and roadmap
 ### Core Pipeline
 - PDF ingestion and section-aware parsing
 - Structured extraction of claims, methods, datasets, baselines, and limitations
 - Discussion question generation with a critic/revision loop
 - Retrieval of related papers, reviewer critiques, and paper-conditioned question examples
 
-### Agentic Workflow
-The agentic workflow will be an option launched from the existing UI for a selected paper, alongside the current application flow. The agent will choose which available paper operations to use, reuse suitable stored fields, and generate and critique questions. The workflow will grow incrementally as design adds more useful agent capabilities; the current design and extension points are described in [Agentic workflow design](#agentic-workflow-design).
+### Agentic Workflow (current)
+The agentic workflow is an option launched from the existing UI for a selected prepared paper, alongside the standard generator. A bounded LangGraph graph gathers context, generates candidates, critiques them, and routes each model verdict to acceptance, revision, or replacement. The workflow can grow incrementally as design adds more useful capabilities; its current design and extension points are described in [Agentic workflow design](#agentic-workflow-design).
 
 ### Agent example library
 The UI has a separate example-library flow for uploading a source paper PDF and
@@ -53,7 +53,7 @@ paper record.
 ### Platform
 - FastAPI backend with async jobs and streaming responses
 - PostgreSQL (with vector search) plus a NoSQL store for raw and semi-structured data
-- Extend the existing web UI with an action to start the agentic workflow for a selected paper
+- Start the agentic workflow from the selected paper in the existing web UI and stream its activity
 - Tracing and observability for LLM calls and agent runs
   
 ## Initial Design Notes
@@ -242,9 +242,9 @@ and retrieval chunks.
 
 ## Agentic workflow design
 
-This section records the current boundary between the application and future
-agent orchestration. The agent itself is not implemented yet; the current UI
-continues to trigger the existing fixed pipeline.
+This section documents the implemented agent path and the boundaries that keep
+it extensible. The standard UI pipeline remains available; the agentic run is a
+separate action on a prepared paper.
 
 ### Current design
 
@@ -254,15 +254,15 @@ ingestion/parsing flow. The agent toolset reads that prepared context, extracts
 fields only when needed, proposes and critiques questions, then saves the final
 question list.
 
-LangChain adapters live in `app.services.agent_tools`. Install them with
-`pip install -e ".[agent,gemini,openreview]"`. The pure tools are exported in
-`PAPER_TOOLS`; `create_paper_tools(session_factory)` combines them with the
-database-backed lookup and final-save operations without exposing a session or
-database credentials as model arguments. Each adapter has a descriptive tool
-name and description, an explicit Pydantic input schema, and a Pydantic return
-type for its output schema; `PAPER_TOOL_OUTPUT_SCHEMAS` exposes those output
-models by tool name. The tools can be passed directly to LangChain or LangGraph;
-no agent or graph is created here.
+LangChain adapters live in `app.services.agent_tools`; the graph is in
+`app.services.agent_graph`. Install the optional dependencies with
+`pip install -e ".[agent,gemini,openreview]"`. `create_paper_tools(session_factory)`
+combines pure and database-backed tools without exposing a session or database
+credentials as model arguments. Each adapter has a descriptive name, a clear
+tool description, an explicit Pydantic input schema, and a typed output model;
+`PAPER_TOOL_OUTPUT_SCHEMAS` exposes output models by tool name. The LangGraph
+invokes these tools from bounded nodes and passes the workflow system prompt to
+the generation and critique models.
 
 | Tool/service | Input | Output | Side effects |
 | --- | --- | --- | --- |
@@ -274,30 +274,48 @@ no agent or graph is created here.
 | `critique_question(...)` | Candidate question, paper context, and all-version review context | `QuestionCritique` verdict, rubric scores, strengths/issues, optional revision | Gemini call; no database writes. |
 | `save_final_questions(db, paper_id, questions)` | Session, paper UUID, final questions paired with critique results | `QuestionGenerationResponse` | Saves questions with `keep` verdicts as final, linked to the latest paper version; stores focus, rationale, and critique details. |
 
-### Agent tool groups
+### Graph flow and model decisions
 
-- **Context:** `get_stored_paper` reads the prepared paper, and
-  `get_all_reviews_for_paper` gathers its reviews across every stored version,
-  tagged with version and forum provenance. Call the review lookup for each run.
-  Check stored extracted fields before calling `extract_paper_fields`; extraction
-  calls Gemini but does not write to the database. Its result includes merged
-  values ready for `propose_questions`.
-- **Example retrieval:** `retrieve_similar_example_questions` embeds the target
-  paper's abstract and available claims, then searches the source-paper vectors
-  in `example_pairs`. It returns top matches as paper/question pairs; pass these
-  to `propose_questions` as few-shot examples. Similarity is based on the source
-  papers, not question text alone.
-- **Generation loop:** `propose_questions` creates candidates and
-  `critique_question` evaluates each one. Both receive the all-version review
-  context to avoid duplicate reviewer comments and surface unresolved concerns.
-  Proposals also receive the retrieved paper/question pairs as guidance. The
-  agent retains the latest critique alongside any revised question.
-- **Terminal:** `save_final_questions` persists only finished questions whose
-  latest critique verdict is `keep`.
-- **Preparation kept outside the agent:** `ingest_forum`, `ingest_upload`, and
-  `parse_paper_text` remain part of the UI's prepare-paper path and are not in
-  the agent toolset. A future version can add ingestion tools if handling an
-  under-prepared paper becomes an agent responsibility.
+The UI exposes **Run agentic workflow** after a paper has been prepared. It
+starts `POST /api/v1/papers/{paper_id}/agentic-questions/progress` and streams
+graph milestones into the existing Activity panel. The run starts with the
+selected paper ID, a generated system prompt containing the question goal and
+hard limits, and the available tool set.
+
+The graph fixes operation order and safety limits while leaving quality
+judgments to Gemini's structured outputs:
+
+1. **Gather context:** `get_stored_paper` loads the latest prepared paper.
+   `get_all_reviews_for_paper` adds reviews across every retained version. The
+   graph reuses stored extracted fields, calling `extract_paper_fields` only
+   when fields are absent. It also retrieves paper-conditioned examples; if
+   example retrieval fails, the run can continue without examples.
+2. **Generate:** `propose_questions` returns structured candidate questions,
+   focus labels, and rationales using the paper, extracted fields, all-version
+   reviews, similar-paper examples, and workflow system prompt.
+3. **Critique:** `critique_question` scores each candidate and returns a
+   model-generated `keep`, `revise`, or `reject` verdict plus an optional
+   revision. A conditional graph edge reads this verdict: `keep` accepts the
+   candidate; `revise` uses the model's suggested text and sends it back for
+   critique; `reject` drops it.
+4. **Replace or finalize:** Dropped candidates are replaced through the generate
+   node when more questions are needed and budget remains. When the requested
+   count is accepted or the budget is exhausted, the graph calls
+   `save_final_questions` once for accepted questions. It saves nothing when no
+   candidate passes critique.
+
+There are at most two revisions (three critique calls) per candidate and 40
+tool calls per run, including the terminal save. The graph reserves the final
+call for saving accepted questions. Reaching the requested count ends the run
+early. There is no human approval step. The UI displays context gathering,
+extraction/example retrieval, proposal rounds, each critique verdict, revisions,
+and final persistence in the Activity panel.
+
+Ingestion, upload, and paper parsing remain UI-triggered preparation steps.
+They are not available to the graph, which starts only after the UI has a
+stored paper. The standard `generate_questions_from_context` and
+`generate_and_store_questions` path remains the non-agentic fallback and is not
+exposed as an agent tool.
 
 `propose_questions` and `critique_question` are standalone functions in
 `app.services.gemini`, with validated Pydantic output models. The proposal
@@ -309,37 +327,10 @@ available through the `generate_questions_from_context` and
 route; neither is exported as an agent tool, avoiding overlapping generation
 choices in the agent tool list.
 
-### Intended agent decisions
-
-The orchestration should make choices from the context it receives for each
-paper rather than assuming every operation must run:
-
-1. The user starts the agentic run from the UI after preparing a paper. The
-   agent calls `get_stored_paper` and `get_all_reviews_for_paper` to gather the
-   latest paper context and reviews from all retained versions.
-2. Reuse adequate extracted fields. If they are absent or insufficient, call
-   `extract_paper_fields`. Pass its merged values and the aggregated review
-   context to `propose_questions`.
-3. Call `retrieve_similar_example_questions` with the paper's abstract and
-   available claims. Pass the returned pairs as few-shot examples to
-   `propose_questions`; the source-paper text, not question-only similarity,
-   determines which examples are selected.
-4. Critique proposed questions with the same review context to check for
-   duplicated reviewer comments and unresolved concerns. Revise only the ones
-   that need work, with a bounded retry count and the latest critique attached
-   to each candidate.
-5. Add retrieval of related work or reviewer critiques when that capability is
-   available and useful for the paper.
-6. When the loop is complete, call `save_final_questions` once with the final
-   questions and their keep critiques. Return the saved results to the UI.
-   Starting the workflow is an explicit UI action; a human approval checkpoint
-   is not part of the planned agent loop.
-
 ### Extending the workflow
 
-Future orchestration should own ordering, branching, and bounded retries.
-Individual tools should stay focused on one operation and expose
-the information an orchestrator needs to choose the next step:
+The LangGraph owns ordering, branching, and bounded retries. Keep tools focused
+on one operation, with outputs that give graph nodes the information they need:
 
 - Give each new tool an explicit Pydantic input and output model, a concise
   description that says when it is useful, and a clear statement of database or
@@ -355,15 +346,15 @@ the information an orchestrator needs to choose the next step:
   capabilities so future workflows can opt into them per paper.
 - Version prompts and keep proposal/critique outputs structured so workflow
   changes can be compared with evaluation data.
-- Enforce stopping limits in graph state as well as in the system prompt: at
+- Keep stopping limits in graph state and the system prompt: at
   most two revisions (three critique calls) per question and at most 40 tool
   calls per run, including the final save. Reserve a tool call for
   `save_final_questions` once any candidates are ready.
 
-`app.services.agent_policy` defines these limits and a prompt builder that
-states the run goal, when to reuse or extract context, the revision policy, and
-the terminal save conditions. The workflow graph should maintain the counters
-and enforce the same limits rather than relying on the prompt alone.
+`app.services.agent_policy` defines these limits and builds the prompt with the
+run goal, graph contract, revision policy, and terminal-save conditions. The
+workflow graph maintains counters and enforces the same limits rather than
+relying on the prompt alone.
 
 The `example_pairs` table stores each example question with its source paper's
 title and representative abstract/claims, a 768-dimensional paper embedding,
@@ -381,12 +372,11 @@ returns an empty list until matching examples are stored.
 
 ### Incremental development
 
-The agentic workflow is expected to change as design work surfaces useful new
-roles for the agents. Start with a UI action that launches the workflow for a
-selected paper, then add capabilities in small steps without treating the
-initial sequence as a permanent graph. Potential additions include retrieval of
-related work or reviews, citation lookup, and other paper-analysis tools.
-Workflow execution will not require human approval or collection of user edits.
+The agentic workflow will grow as design work surfaces useful new roles for the
+agents. Extend its graph in small steps without treating the current skeleton as
+the final design. Potential additions include related-work retrieval, citation
+lookup, and other paper-analysis tools. Workflow execution does not require
+human approval or collect user edits as training data.
 
 The current UI ingestion convenience operations still run parsing and
 extraction as part of the existing prepare-paper flow. If a future agent needs

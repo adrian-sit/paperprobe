@@ -9,13 +9,25 @@ from app.api.progress import ProgressReporter, progress_response
 from app.db.models import Paper, PaperVersion, Question
 from app.db.session import get_db_session, get_session_factory
 from app.schemas.papers import (
-    OpenReviewIngestRequest, PaperDetail, PaperVersionDetail, QuestionGenerationRequest,
-    QuestionGenerationResponse, StoredExtractedField, StoredQuestion, StoredReview, StoredSection,
+    OpenReviewIngestRequest,
+    PaperDetail,
+    PaperVersionDetail,
+    QuestionGenerationRequest,
+    QuestionGenerationResponse,
+    StoredExtractedField,
+    StoredQuestion,
+    StoredReview,
+    StoredSection,
 )
 from app.services.openreview import OpenReviewContentError
 from app.services.paper_pipeline import (
-    MAX_PDF_BYTES, _load, _question, _serialize, generate_and_store_questions,
-    ingest_forum, ingest_upload,
+    MAX_PDF_BYTES,
+    _load,
+    _question,
+    _serialize,
+    generate_and_store_questions,
+    ingest_forum,
+    ingest_upload,
 )
 
 router = APIRouter()
@@ -101,6 +113,27 @@ async def create_questions_with_progress(paper_id: UUID, request: QuestionGenera
             return await generate_and_store_questions(db, paper_id, request.count, report)
         except Exception as exc:
             await report("error", "Generate questions", "error", str(exc))
+            raise
+    return database_progress_response(operation)
+
+
+@router.post("/{paper_id}/agentic-questions/progress")
+async def run_agentic_questions_with_progress(
+    paper_id: UUID, request: QuestionGenerationRequest
+):
+    async def operation(report: ProgressReporter, _db: AsyncSession):
+        try:
+            from app.services.agent_graph import run_agentic_question_workflow
+            return await run_agentic_question_workflow(
+                paper_id,
+                get_session_factory(),
+                report=report,
+                question_count=request.count,
+            )
+        except ImportError as exc:
+            raise RuntimeError('Agent support is optional. Install it with: pip install -e ".[agent,gemini,openreview]"') from exc
+        except Exception as exc:
+            await report("agent-error", "Agent workflow", "failure", str(exc))
             raise
     return database_progress_response(operation)
 

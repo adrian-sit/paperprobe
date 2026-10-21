@@ -1,9 +1,21 @@
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
 from app.core.config import get_settings
 from app.schemas.extraction import Claim, QuestionCritique, QuestionGeneration
 from app.services.paper_sections import PaperTextSection, section_field_groups
+
+T = TypeVar("T")
+
+
+def _with_client(genai: Any, api_key: str, operation: Callable[[Any], T]) -> T:
+    """Keep the synchronous Gemini client alive for the full request and close it."""
+    client = genai.Client(api_key=api_key)
+    try:
+        return operation(client)
+    finally:
+        client.close()
 
 
 @dataclass(frozen=True)
@@ -26,7 +38,6 @@ def extract_section_fields(title: str, sections: list[PaperTextSection]) -> list
     if not settings.gemini_api_key:
         raise RuntimeError("GEMINI_API_KEY is required for extraction.")
 
-    client = genai.Client(api_key=settings.gemini_api_key)
     response_types = {
         "summary": (str, ...),
         "claims": (list[Claim], ...),
@@ -51,9 +62,7 @@ def extract_section_fields(title: str, sections: list[PaperTextSection]) -> list
             **{name: response_types[name] for name in fields},
         )
         field_instructions = "\n".join(f"- {name}: extract {instructions[name]}." for name in fields)
-        response = client.models.generate_content(
-            model=settings.gemini_model,
-            contents=(
+        contents = (
                 "Extract only information supported by this paper section. Do not fill gaps "
                 "from outside knowledge. Return empty lists for list fields and an empty string "
                 "for summary when the section does not support the requested information.\n"
@@ -61,11 +70,17 @@ def extract_section_fields(title: str, sections: list[PaperTextSection]) -> list
                 f"Section: {section.heading}\n"
                 f"Requested fields:\n{field_instructions}\n\n"
                 f"Section text:\n{section.content}"
-            ),
-            config=types.GenerateContentConfig(
+            )
+        config = types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=output_schema,
                 temperature=0,
+            )
+        response = _with_client(
+            genai,
+            settings.gemini_api_key,
+            lambda client, contents=contents, config=config: client.models.generate_content(
+                model=settings.gemini_model, contents=contents, config=config
             ),
         )
         if not response.text:
@@ -93,7 +108,6 @@ def generate_questions(
     if not settings.gemini_api_key:
         raise RuntimeError("GEMINI_API_KEY is required for question generation.")
 
-    client = genai.Client(api_key=settings.gemini_api_key)
     context = {
         "title": title,
         "abstract": abstract,
@@ -101,20 +115,24 @@ def generate_questions(
     }
     if paper_text.strip():
         context["paper_text"] = paper_text
-    response = client.models.generate_content(
-        model=settings.gemini_model,
-        contents=(
+    contents = (
             f"Generate exactly {count} distinct, thoughtful peer-review discussion questions. "
             "Each question must be specific, answerable, critical when appropriate, and grounded "
             "only in the supplied paper context. Use full paper text when present; if absent, "
             "rely on the available title, abstract, and extracted fields. Do not invent study "
             "details or cite outside work.\n\n"
             f"Paper context:\n{context}"
-        ),
-        config=types.GenerateContentConfig(
+        )
+    config = types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=QuestionGeneration,
             temperature=0.3,
+        )
+    response = _with_client(
+        genai,
+        settings.gemini_api_key,
+        lambda client: client.models.generate_content(
+            model=settings.gemini_model, contents=contents, config=config
         ),
     )
     if not response.text:
@@ -133,6 +151,7 @@ def propose_questions(
     paper_text: str = "",
     review_context: list[dict] | None = None,
     example_questions: list[dict] | None = None,
+    workflow_instructions: str = "",
 ) -> QuestionGeneration:
     """Propose grounded questions using paper evidence, reviews, and similar-paper examples."""
     try:
@@ -154,9 +173,7 @@ def propose_questions(
         context["review_context"] = review_context
     if example_questions:
         context["example_questions"] = example_questions
-    response = genai.Client(api_key=settings.gemini_api_key).models.generate_content(
-        model=settings.gemini_model,
-        contents=(
+    contents = (
             f"Propose exactly {count} distinct questions for a peer-review discussion. "
             "Prefer questions that probe evidence, assumptions, methodology, scope, or limitations. "
             "Each question must be specific, answerable, and supported by the supplied paper context. "
@@ -167,11 +184,18 @@ def propose_questions(
             "to understand useful question patterns, but do not copy them or assume their paper-specific "
             "facts apply to this paper. Give each question a short focus and explain why it is useful.\n\n"
             f"Paper context:\n{context}"
-        ),
-        config=types.GenerateContentConfig(
+        )
+    config = types.GenerateContentConfig(
+            system_instruction=workflow_instructions or None,
             response_mime_type="application/json",
             response_schema=QuestionGeneration,
             temperature=0.3,
+        )
+    response = _with_client(
+        genai,
+        settings.gemini_api_key,
+        lambda client: client.models.generate_content(
+            model=settings.gemini_model, contents=contents, config=config
         ),
     )
     if not response.text:
@@ -189,6 +213,7 @@ def critique_question(
     extracted_fields: dict[str, dict] | None = None,
     paper_text: str = "",
     review_context: list[dict] | None = None,
+    workflow_instructions: str = "",
 ) -> QuestionCritique:
     """Assess a candidate question against paper evidence and versioned reviewer context."""
     try:
@@ -210,9 +235,7 @@ def critique_question(
         context["paper_text"] = paper_text
     if review_context:
         context["review_context"] = review_context
-    response = genai.Client(api_key=settings.gemini_api_key).models.generate_content(
-        model=settings.gemini_model,
-        contents=(
+    contents = (
             "Critique the candidate question only against the supplied paper context. Score each "
             "dimension from 1 (poor) to 5 (strong). Grounding means the question does not assume "
             "unsupported facts. Answerability means the authors could respond using their work. "
@@ -223,11 +246,18 @@ def critique_question(
             "reviewer comment, and consider whether it usefully probes a concern that later revisions "
             "may not have resolved. Do not reward generic wording. Provide a revised question only for revise.\n\n"
             f"Paper context:\n{context}\n\nCandidate question:\n{question}"
-        ),
-        config=types.GenerateContentConfig(
+        )
+    config = types.GenerateContentConfig(
+            system_instruction=workflow_instructions or None,
             response_mime_type="application/json",
             response_schema=QuestionCritique,
             temperature=0,
+        )
+    response = _with_client(
+        genai,
+        settings.gemini_api_key,
+        lambda client: client.models.generate_content(
+            model=settings.gemini_model, contents=contents, config=config
         ),
     )
     if not response.text:

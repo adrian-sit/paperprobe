@@ -12,9 +12,14 @@ from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.schemas.extraction import Claim, FinalAgentQuestion, QuestionCritique, QuestionGeneration
 from app.schemas.examples import SimilarExampleQuestion, SimilarExampleQuestions
-from app.schemas.papers import PaperDetail, PaperReviewContext, PaperReviewContextResponse, QuestionGenerationResponse
+from app.schemas.extraction import Claim, FinalAgentQuestion, QuestionCritique, QuestionGeneration
+from app.schemas.papers import (
+    PaperDetail,
+    PaperReviewContext,
+    PaperReviewContextResponse,
+    QuestionGenerationResponse,
+)
 from app.services.example_retrieval import retrieve_similar_example_questions
 from app.services.gemini import SectionExtractedField, critique_question, propose_questions
 from app.services.paper_pipeline import (
@@ -72,7 +77,7 @@ class PaperContextInput(BaseModel):
         default_factory=dict,
         description="Existing structured fields keyed by field type, reusable without re-extraction.",
     )
-    count: int = Field(default=5, ge=3, le=10, description="Number of distinct questions to propose.")
+    count: int = Field(default=5, ge=1, le=10, description="Number of distinct questions to propose.")
     paper_text: str = Field(default="", description="Optional full text for added grounding.")
     review_context: list[PaperReviewContext] = Field(
         default_factory=list,
@@ -88,6 +93,10 @@ class PaperContextInput(BaseModel):
             "Use as few-shot guidance, not as questions to copy."
         ),
     )
+    workflow_instructions: str = Field(
+        default="",
+        description="System instructions for the bounded agentic run that is using this generation tool.",
+    )
 
 
 class CritiqueQuestionInput(BaseModel):
@@ -101,6 +110,10 @@ class CritiqueQuestionInput(BaseModel):
     review_context: list[PaperReviewContext] = Field(
         default_factory=list,
         description="Reviews from all versions for duplicate-comment and unresolved-point checks.",
+    )
+    workflow_instructions: str = Field(
+        default="",
+        description="System instructions for the bounded agentic run that is using this critique tool.",
     )
 
 
@@ -168,20 +181,21 @@ def extract_paper_fields_tool(title: str, full_text: str, abstract: str = "") ->
         "choosing which context to provide; pass all-version review_context from get_all_reviews_for_paper "
         "to avoid duplicate comments and build on unresolved reviewer points. Pass example_questions from "
         "retrieve_similar_example_questions as paper-conditioned few-shot guidance; do not copy them verbatim. "
-        "Existing extracted fields can be passed directly. Returns each "
+        "Existing extracted fields can be passed directly. Follow workflow_instructions when provided. Returns each "
         "proposal in QuestionGeneration with focus and reason it is useful. This does not save questions."
     ),
 )
 def propose_questions_tool(
     title: str, abstract: str = "", extracted_fields: dict[str, dict] | None = None,
     count: int = 5, paper_text: str = "", review_context: list[PaperReviewContext] | None = None,
-    example_questions: list[SimilarExampleQuestion] | None = None,
+    example_questions: list[SimilarExampleQuestion] | None = None, workflow_instructions: str = "",
 ) -> QuestionGeneration:
     return propose_questions(
         title, abstract, extracted_fields or {}, count, paper_text,
         _review_context_payload(review_context),
         [item.model_dump(mode="json") if isinstance(item, SimilarExampleQuestion) else item
          for item in example_questions or []],
+        workflow_instructions,
     )
 
 
@@ -192,7 +206,7 @@ def propose_questions_tool(
         "Assess one candidate question against the supplied paper context for specificity, grounding, "
         "answerability, and critical value. Pass all-version review_context from get_all_reviews_for_paper "
         "to check whether the question duplicates an existing reviewer comment or addresses an unresolved point. "
-        "Use after proposing a question or when a user supplies one. "
+        "Use after proposing a question or when a user supplies one. Follow workflow_instructions when provided. "
         "Returns QuestionCritique: scores, a keep/revise/reject verdict, issues, and a suggested revision "
         "when appropriate."
     ),
@@ -200,10 +214,11 @@ def propose_questions_tool(
 def critique_question_tool(
     question: str, title: str, abstract: str = "", extracted_fields: dict[str, dict] | None = None,
     paper_text: str = "", review_context: list[PaperReviewContext] | None = None,
+    workflow_instructions: str = "",
 ) -> QuestionCritique:
     return critique_question(
         question, title, abstract, extracted_fields, paper_text,
-        _review_context_payload(review_context),
+        _review_context_payload(review_context), workflow_instructions,
     )
 
 

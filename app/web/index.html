@@ -8,7 +8,7 @@
       const savedTheme = localStorage.getItem('paperprobe-theme');
       document.documentElement.dataset.theme = savedTheme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
     </script>
-    <link rel="stylesheet" href="/static/styles.css?v=example-library-management-1" />
+    <link rel="stylesheet" href="/static/styles.css?v=agentic-workflow-1" />
   </head>
   <body>
     <main class="shell">
@@ -142,13 +142,16 @@
         <section class="panel questions-panel">
           <div class="paper-heading">
             <div><p class="eyebrow">DISCUSSION QUESTIONS</p><h2>Interrogate the paper</h2></div>
-            <button id="question-button" type="button">Generate 5 questions</button>
+            <div class="question-actions">
+              <button id="question-button" type="button">Generate 5 questions</button>
+              <button id="agentic-question-button" class="secondary-button" type="button">Run agentic workflow</button>
+            </div>
           </div>
-          <p class="hint">Questions use the title, abstract, and extracted fields saved from the paper's sections.</p>
+          <p class="hint">Choose the standard generator or the agentic workflow, which gathers review context, proposes questions, critiques them, and saves accepted results.</p>
           <ol id="questions" class="questions"></ol>
         </section>
       </section>
     </main>
-    <script src="/static/app.js?v=example-library-management-1"></script>
+    <script src="/static/app.js?v=agentic-workflow-1"></script>
   </body>
 </html>

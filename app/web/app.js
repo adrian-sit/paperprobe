@@ -3,6 +3,7 @@ const themeToggle = document.querySelector('#theme-toggle');
 const statusLine = document.querySelector('#status');
 const fetchButton = document.querySelector('#fetch-button');
 const questionButton = document.querySelector('#question-button');
+const agenticQuestionButton = document.querySelector('#agentic-question-button');
 const activityPanel = document.querySelector('.activity');
 const activityLog = document.querySelector('#activity-log');
 const activityState = document.querySelector('#activity-state');
@@ -268,6 +269,40 @@ questionButton.addEventListener('click', async () => {
   try { const result = await requestProgress(`/api/v1/papers/${state.paperId}/questions/progress`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({count:5}) }); const list = document.querySelector('#questions'); list.replaceChildren(); result.questions.forEach(question => { const li=document.createElement('li'); li.textContent=question.text; list.append(li); }); setStatus('Questions generated and saved.'); }
   catch (error) { failActivity(error.message); setStatus(error.message, true); }
   finally { questionButton.disabled = false; }
+});
+
+agenticQuestionButton.addEventListener('click', async () => {
+  if (!state.paperId) return;
+  agenticQuestionButton.disabled = true;
+  questionButton.disabled = true;
+  beginActivity('Starting the agentic question workflow…');
+  activityPanel.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  try {
+    const result = await requestProgress(
+      `/api/v1/papers/${state.paperId}/agentic-questions/progress`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ count: 5 }),
+      },
+    );
+    const list = document.querySelector('#questions');
+    list.replaceChildren();
+    (result.questions || []).forEach(question => {
+      const item = document.createElement('li');
+      item.textContent = question.text;
+      list.append(item);
+    });
+    setStatus(result.saved_count
+      ? `Agentic workflow saved ${result.saved_count} of ${result.requested_count} requested questions.`
+      : 'The agent completed its critique loop; no questions met the quality bar.');
+  } catch (error) {
+    failActivity(error.message);
+    setStatus(error.message, true);
+  } finally {
+    agenticQuestionButton.disabled = false;
+    questionButton.disabled = false;
+  }
 });
 
 const exampleForm = document.querySelector('#example-upload-form');

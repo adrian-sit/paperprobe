@@ -43,6 +43,8 @@ code { background:var(--surface-soft); }
 .header-top { display:flex; align-items:center; justify-content:space-between; gap:16px; }
 .header-top .eyebrow { margin-bottom:7px; }
 @media (max-width:420px) { .theme-toggle { padding:8px 10px; } }
+.question-actions { display:flex; flex-wrap:wrap; gap:8px; }
+@media (max-width:700px) { .question-actions { width:100%; flex-direction:column; }.question-actions button { width:100%; } }
 .saved-example-library { margin-top:32px; padding-top:8px; border-top:1px solid var(--line); }
 .saved-example-library .example-question-heading { margin-top:16px; }
 .saved-example-papers { display:grid; gap:14px; }
