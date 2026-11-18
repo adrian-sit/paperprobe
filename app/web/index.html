@@ -8,7 +8,7 @@
       const savedTheme = localStorage.getItem('paperprobe-theme');
       document.documentElement.dataset.theme = savedTheme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
     </script>
-    <link rel="stylesheet" href="/static/styles.css?v=agentic-workflow-1" />
+    <link rel="stylesheet" href="/static/styles.css?v=pipeline-1" />
   </head>
   <body>
     <main class="shell">
@@ -51,7 +51,7 @@
       </section>
 
       <section class="panel example-library-panel" aria-labelledby="example-library-title">
-        <p class="eyebrow">AGENT EXAMPLES</p>
+        <p class="eyebrow">QUESTION EXAMPLES</p>
         <h2 id="example-library-title">Add a paper and its questions</h2>
         <p class="hint">Upload a source paper and save 1–20 questions written about it. PaperProbe stores each question with the source paper context so similar papers can retrieve relevant examples later.</p>
         <form id="example-upload-form">
@@ -144,14 +144,13 @@
             <div><p class="eyebrow">DISCUSSION QUESTIONS</p><h2>Interrogate the paper</h2></div>
             <div class="question-actions">
               <button id="question-button" type="button">Generate 5 questions</button>
-              <button id="agentic-question-button" class="secondary-button" type="button">Run agentic workflow</button>
             </div>
           </div>
-          <p class="hint">Choose the standard generator or the agentic workflow, which gathers review context, proposes questions, critiques them, and saves accepted results.</p>
+          <p class="hint">Generate discussion questions from the latest revision’s title, abstract, and extracted fields.</p>
           <ol id="questions" class="questions"></ol>
         </section>
       </section>
     </main>
-    <script src="/static/app.js?v=agentic-workflow-1"></script>
+    <script src="/static/app.js?v=pipeline-1"></script>
   </body>
 </html>

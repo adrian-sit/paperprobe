@@ -117,27 +117,6 @@ async def create_questions_with_progress(paper_id: UUID, request: QuestionGenera
     return database_progress_response(operation)
 
 
-@router.post("/{paper_id}/agentic-questions/progress")
-async def run_agentic_questions_with_progress(
-    paper_id: UUID, request: QuestionGenerationRequest
-):
-    async def operation(report: ProgressReporter, _db: AsyncSession):
-        try:
-            from app.services.agent_graph import run_agentic_question_workflow
-            return await run_agentic_question_workflow(
-                paper_id,
-                get_session_factory(),
-                report=report,
-                question_count=request.count,
-            )
-        except ImportError as exc:
-            raise RuntimeError('Agent support is optional. Install it with: pip install -e ".[agent,gemini,openreview]"') from exc
-        except Exception as exc:
-            await report("agent-error", "Agent workflow", "failure", str(exc))
-            raise
-    return database_progress_response(operation)
-
-
 @router.get("/{paper_id}", response_model=PaperDetail)
 async def get_paper(paper_id: UUID, db: AsyncSession = Depends(get_db_session)):
     paper = await _load(db, paper_id)
